@@ -282,20 +282,25 @@ class ChannelWorktreeManager:
         repo_root: str | Path,
         worktree_base: str,
         branch_prefix: str,
-        channel_id: int,
+        slug: str,
+        *,
+        channel_id: int = 0,
     ) -> WorktreePaths:
-        """Compute absolute worktree path and branch name.
+        """Compute absolute worktree path and branch name from a slug.
 
-        No IO. ``worktree_base`` is interpreted relative to ``repo_root``
-        when not absolute (matches projects.json convention like
-        ``.worktrees``).
+        Phase-2: slug-based path / branch (``ch-<slug>``, ``<prefix>/<slug>``).
+        ``channel_id`` is retained on the returned struct for legacy callers
+        that use it as an opaque identifier (e.g. cleanup flows).
+
+        ``worktree_base`` is interpreted relative to ``repo_root`` when not
+        absolute. No IO.
         """
         repo = Path(repo_root).resolve()
         base = Path(worktree_base)
         if not base.is_absolute():
             base = repo / base
-        wt_path = (base / f"ch-{channel_id}").resolve()
-        branch = f"{branch_prefix}/{channel_id}"
+        wt_path = (base / f"ch-{slug}").resolve()
+        branch = f"{branch_prefix}/{slug}"
         return WorktreePaths(
             repo_root=str(repo),
             worktree_path=str(wt_path),
@@ -589,6 +594,54 @@ class ChannelWorktreeManager:
             return RemovalResult(
                 removed=True,
                 reason="removed",
+                path=paths.worktree_path,
+            )
+        return RemovalResult(
+            removed=False,
+            reason=_classify_git_error(result.stderr),
+            path=paths.worktree_path,
+        )
+
+    # -- Force removal (explicit escape hatch, /ch-worktree-cleanup --force) -----
+
+    def remove_force(
+        self,
+        paths: WorktreePaths,
+        *,
+        dry_run: bool = False,
+    ) -> RemovalResult:
+        """Unconditionally remove a worktree — INCLUDING dirty ones.
+
+        Only callable from ``/ch-worktree-cleanup --force`` after explicit
+        user ✅ confirmation. Do NOT use this from automatic cleanup paths
+        (``on_guild_channel_delete``, ``/channel-reset``) — those MUST use
+        ``remove_if_clean`` which preserves dirty worktrees.
+
+        Uses ``git worktree remove --force``.
+        """
+        wt = Path(paths.worktree_path)
+        if not wt.exists():
+            return RemovalResult(
+                removed=False,
+                reason="not_exists",
+                path=paths.worktree_path,
+            )
+
+        cmd = ("git", "-C", paths.repo_root, "worktree", "remove", "--force", paths.worktree_path)
+        if dry_run:
+            return RemovalResult(
+                removed=False,
+                reason="would_force_remove",
+                path=paths.worktree_path,
+                planned_commands=[_format_cmd(*cmd)],
+            )
+
+        result = _run_git("worktree", "remove", "--force", paths.worktree_path, cwd=paths.repo_root)
+        if result.ok:
+            self.invalidate_cache(paths.worktree_path)
+            return RemovalResult(
+                removed=True,
+                reason="force_removed",
                 path=paths.worktree_path,
             )
         return RemovalResult(

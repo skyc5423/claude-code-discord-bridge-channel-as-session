@@ -52,7 +52,12 @@ T = TypeVar("T")
 
 @dataclass
 class ChannelSessionRecord:
-    """A single row from the ``channel_sessions`` table."""
+    """A single row from the ``channel_sessions`` table.
+
+    Phase-2 adds ``channel_name`` and ``category_id`` for name-pattern
+    auto-registration. Pre-phase-2 rows have NULL for both until the first
+    message arrives and ``handle_message`` backfills them via ``ensure``.
+    """
 
     channel_id: int
     session_id: str | None
@@ -73,6 +78,8 @@ class ChannelSessionRecord:
     summary: str | None
     created_at: str
     last_used_at: str
+    channel_name: str | None = None
+    category_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +177,8 @@ class ChannelSessionRepository:
         cwd_mode: str,
         model: str | None,
         permission_mode: str | None,
+        channel_name: str | None = None,
+        category_id: int | None = None,
     ) -> ChannelSessionRecord:
         """Sync-or-create a channel record.
 
@@ -203,6 +212,7 @@ class ChannelSessionRepository:
                     channel_id, project_name, repo_root,
                     worktree_path, branch_name, cwd_mode,
                     model, permission_mode,
+                    channel_name, category_id,
                     session_id, context_window, context_used,
                     turn_count, error_count, warned_80pct_at,
                     topic_last_set_at, topic_last_pct, summary,
@@ -212,6 +222,7 @@ class ChannelSessionRepository:
                     :channel_id, :project_name, :repo_root,
                     :worktree_path, :branch_name, :cwd_mode,
                     :model, :permission_mode,
+                    :channel_name, :category_id,
                     NULL, NULL, NULL,
                     0, 0, NULL,
                     NULL, NULL, NULL,
@@ -229,6 +240,12 @@ class ChannelSessionRepository:
                     cwd_mode        = excluded.cwd_mode,
                     model           = excluded.model,
                     permission_mode = excluded.permission_mode,
+                    channel_name    = COALESCE(
+                        excluded.channel_name, channel_sessions.channel_name
+                    ),
+                    category_id     = COALESCE(
+                        excluded.category_id, channel_sessions.category_id
+                    ),
                     last_used_at    = datetime('now', 'localtime')
                 """,
                 {
@@ -240,6 +257,8 @@ class ChannelSessionRepository:
                     "cwd_mode": cwd_mode,
                     "model": model,
                     "permission_mode": permission_mode,
+                    "channel_name": channel_name,
+                    "category_id": category_id,
                 },
             )
             await db.commit()

@@ -1,18 +1,17 @@
-"""Eager per-project ``ClaudeRunner`` cache.
+"""Per-category ``ClaudeRunner`` cache (phase-2).
 
-One ``ClaudeRunner`` instance per channel, pre-created from
-``ProjectsConfig`` at bot startup. ``ChannelSessionService`` (step 7)
-consults this cache on every incoming message::
+Phase-1 held one runner per *channel* (keyed by channel_id).
+Phase-2 holds one runner per *category* (keyed by category_id). Every
+channel inside a category shares the same template runner because they
+share the same repo_root / model / permission_mode. Per-message
+``runner.clone(working_dir=...)`` still isolates subprocesses.
 
-    runner = cache.get(channel_id)
-    if runner is None: ...  # channel not registered
-    per_msg_runner = runner.clone(working_dir=..., thread_id=channel.id)
+``ChannelSessionService`` consults this cache on every incoming message::
 
-The cache holds the *template* runner (no active subprocess) — per-message
-execution is ``runner.clone(working_dir=...)`` so the cached instance is
-reusable forever.
+    runner = cache.get(channel_id)  # maps channel → category → runner
+    if runner is None: ...
 
-See ``docs/CHANNEL_AS_SESSION_PHASE1_V3.md`` §2-a.
+See ``docs/CHANNEL_AS_SESSION_PHASE2.md`` §1 for the category-keyed design.
 """
 
 from __future__ import annotations
@@ -22,30 +21,27 @@ import os
 from collections.abc import Callable
 
 from ..claude.runner import ClaudeRunner
-from ..config.projects_config import ProjectConfig, ProjectsConfig
+from ..config.projects_config import CategoryProjectConfig, ProjectsConfig
 
 logger = logging.getLogger(__name__)
 
 
-RunnerFactory = Callable[[ProjectConfig], ClaudeRunner]
+RunnerFactory = Callable[[CategoryProjectConfig], ClaudeRunner]
 
 
 class RunnerCacheError(RuntimeError):
-    """Raised when a runner cannot be constructed for a project.
+    """Raised when a runner cannot be constructed for a category.
 
-    The message identifies the offending ``channel_id`` so bootstrap
+    The message identifies the offending ``category_id`` so bootstrap
     failures point straight at the projects.json line to fix.
     """
 
 
-def _default_runner_factory(project: ProjectConfig) -> ClaudeRunner:
-    """Build a ``ClaudeRunner`` template from a ``ProjectConfig``.
+def _default_runner_factory(project: CategoryProjectConfig) -> ClaudeRunner:
+    """Build a ``ClaudeRunner`` template from a ``CategoryProjectConfig``.
 
-    - ``command``  — ``$CLAUDE_COMMAND`` or ``"claude"``
-    - ``model``    — project override or runner default ``"sonnet"``
-    - ``permission_mode`` — project override or runner default ``"acceptEdits"``
-    - ``working_dir`` is intentionally NOT set here; ``ChannelSessionService``
-      injects it via ``runner.clone(working_dir=...)`` on every message.
+    ``working_dir`` is intentionally NOT set here — ``ChannelSessionService``
+    injects it via ``runner.clone(working_dir=...)`` on every message.
     """
     kwargs: dict[str, object] = {
         "command": os.getenv("CLAUDE_COMMAND", "claude"),
@@ -58,20 +54,15 @@ def _default_runner_factory(project: ProjectConfig) -> ClaudeRunner:
 
 
 class RunnerCache:
-    """Per-channel ``ClaudeRunner`` template cache.
+    """Category-keyed ``ClaudeRunner`` template cache.
 
-    Eagerly constructs one runner per project at ``__init__`` time so that
-    projects.json errors (bad model name, unexpected field) surface at
-    startup, never during message handling.
+    Eager construction at ``__init__`` so projects.json errors surface at
+    startup, never during message handling. Keys are category_id (from
+    ``CategoryProjectConfig``), not channel_id.
 
-    Concurrency: the cache itself is not thread-safe, but Discord cogs run
-    on a single asyncio event loop, so no locking is needed.
-
-    ``invalidate()`` semantics (see step-5 spec): when a channel is reset
-    we assume *no active subprocess* (caller must have awaited
-    ``runner.kill()`` beforehand), then pop and rebuild from the stored
-    ``ProjectConfig``. ``get()`` after ``invalidate()`` returns the fresh
-    template — callers never have to handle a transient ``None``.
+    Lookups accept channel_id — the cache consults ``ProjectsConfig`` to
+    map the channel back to its category. This keeps the caller API
+    channel-scoped while the storage is category-scoped.
     """
 
     def __init__(
@@ -82,79 +73,84 @@ class RunnerCache:
     ) -> None:
         self._projects = projects
         self._factory: RunnerFactory = runner_factory or _default_runner_factory
-        self._runners: dict[int, ClaudeRunner] = {}
+        self._runners: dict[int, ClaudeRunner] = {}  # category_id → runner
 
-        # Eager construction — fail fast on misconfiguration.
-        for project in projects:
-            self._runners[project.channel_id] = self._build(project)
+        for cat_cfg in projects.categories():
+            self._runners[cat_cfg.category_id] = self._build(cat_cfg)
         logger.info(
-            "RunnerCache initialised: %d project(s) pre-loaded",
+            "RunnerCache initialised: %d category-project(s) pre-loaded",
             len(self._runners),
         )
 
     # -- Internal --------------------------------------------------------
 
-    def _build(self, project: ProjectConfig) -> ClaudeRunner:
+    def _build(self, project: CategoryProjectConfig) -> ClaudeRunner:
         try:
             return self._factory(project)
         except Exception as exc:
             raise RunnerCacheError(
-                f"Failed to build ClaudeRunner for channel_id={project.channel_id} "
+                f"Failed to build ClaudeRunner for category_id={project.category_id} "
                 f"(project={project.name!r}): {type(exc).__name__}: {exc}"
             ) from exc
 
-    # -- Public API ------------------------------------------------------
+    # -- Public API (channel-scoped) -------------------------------------
 
     def get(self, channel_id: int) -> ClaudeRunner | None:
-        """Return the cached template runner, or ``None`` when unregistered."""
-        return self._runners.get(channel_id)
+        """Return the template runner for *channel_id*'s category.
+
+        Returns ``None`` when the channel is unregistered OR when the
+        category is missing from ``_runners`` (should never happen if
+        eager construction succeeded).
+        """
+        registered = self._projects.get(channel_id)
+        if registered is None:
+            return None
+        return self._runners.get(registered.category_id)
 
     def has(self, channel_id: int) -> bool:
-        return channel_id in self._runners
+        return self.get(channel_id) is not None
 
     def invalidate(self, channel_id: int) -> None:
-        """Drop and rebuild the runner for *channel_id*.
+        """Drop and rebuild the runner for *channel_id*'s category.
 
-        Preconditions:
-          * The caller has ensured no active subprocess on the previous
-            runner (``await runner.kill()`` if one was running). The cache
-            cannot do this itself because it is synchronous.
-
-        Post-condition:
-          * If *channel_id* is still registered in ``ProjectsConfig``, a
-            fresh runner replaces the old one (``get()`` returns it).
-          * If *channel_id* is no longer registered, the entry is removed
-            and ``get()`` returns ``None`` afterwards.
+        Preconditions: caller must await any active subprocess kill first.
+        ``/channel-reset`` invokes this so the next message gets a fresh
+        template (same category → same config, but a new Python object).
         """
-        self._runners.pop(channel_id, None)
-        project = self._projects.get(channel_id)
-        if project is None:
+        registered = self._projects.get(channel_id)
+        if registered is None:
             logger.info(
-                "RunnerCache.invalidate: channel_id=%d no longer in projects config — "
-                "entry removed, not rebuilt.",
+                "RunnerCache.invalidate: channel_id=%d is unregistered — nothing to do",
                 channel_id,
             )
             return
-        self._runners[channel_id] = self._build(project)
+        cat_id = registered.category_id
+        self._runners.pop(cat_id, None)
+        cat_cfg = self._projects.get_category(cat_id)
+        if cat_cfg is None:
+            logger.info(
+                "RunnerCache.invalidate: category_id=%d not in projects — entry removed",
+                cat_id,
+            )
+            return
+        self._runners[cat_id] = self._build(cat_cfg)
 
     def reload(self, projects: ProjectsConfig) -> None:
-        """Replace the entire cache from a new ``ProjectsConfig``.
+        """Swap in a new ProjectsConfig and rebuild all runners.
 
-        Designed for a future hot-reload path. Currently the bridge reloads
-        by restarting, so ``reload`` is tested but not invoked in the hot
-        path.
+        Called from the hot-reload ``on_change`` handler. All categories are
+        rebuilt so any config field change takes effect immediately. Active
+        subprocesses (already cloned) are unaffected — they run to completion
+        on the now-orphaned pre-reload template.
         """
         self._projects = projects
         self._runners.clear()
-        for project in projects:
-            self._runners[project.channel_id] = self._build(project)
+        for cat_cfg in projects.categories():
+            self._runners[cat_cfg.category_id] = self._build(cat_cfg)
         logger.info(
-            "RunnerCache reloaded: %d project(s) pre-loaded",
+            "RunnerCache reloaded: %d category-project(s) pre-loaded",
             len(self._runners),
         )
 
     def __len__(self) -> int:
         return len(self._runners)
-
-    def __contains__(self, channel_id: object) -> bool:
-        return channel_id in self._runners

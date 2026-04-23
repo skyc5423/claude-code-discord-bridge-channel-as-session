@@ -45,7 +45,7 @@ from ..claude.types import ImageData
 from ..cogs._run_helper import run_claude_with_config
 from ..cogs.prompt_builder import wants_file_attachment
 from ..cogs.run_config import RunConfig
-from ..config.projects_config import ProjectConfig, ProjectsConfig
+from ..config.projects_config import ProjectsConfig, RegisteredChannel
 from ..database.channel_session_repo import ChannelSessionRepository
 from ..database.repository import SessionRepository
 from ..discord_ui.status import StatusManager
@@ -152,7 +152,7 @@ class ChannelSessionService:
         *,
         channel: discord.TextChannel,
         user_message: discord.Message,
-        project: ProjectConfig,
+        registered: RegisteredChannel,  # phase-2
         prompt: str,
         images: list[ImageData] | None = None,
     ) -> None:
@@ -164,11 +164,13 @@ class ChannelSessionService:
           * Built ``prompt`` and ``images`` via ``build_prompt_and_images``.
           * Interrupted any previous active runner and awaited its task.
 
-        This method never raises for expected conditions — all outcomes
-        surface as structured messages in the channel or DB state changes.
+        Phase-2: the caller now passes the resolved ``RegisteredChannel``
+        instead of a raw ``ProjectConfig`` — ``cwd_mode``/``slug`` come from
+        the channel name (``main`` / ``wt-<slug>``), not from projects.json.
         """
         cid = channel.id
-        effective_mode = project.cwd_mode
+        project = registered.project
+        effective_mode = registered.cwd_mode
 
         # 1. Drift detection ↔ last-known DB record.
         prev = await self._repo.get(cid)
@@ -183,8 +185,7 @@ class ChannelSessionService:
         # 2. Worktree handling + working_dir decision
         worktree_path, branch_name, working_dir = await self._prepare_cwd(
             channel=channel,
-            project=project,
-            effective_mode=effective_mode,
+            registered=registered,
         )
         if working_dir is None:
             # _prepare_cwd already surfaced the failure to the channel.
@@ -201,6 +202,8 @@ class ChannelSessionService:
             cwd_mode=effective_mode,
             model=project.model,
             permission_mode=project.permission_mode,
+            channel_name=registered.channel_name,
+            category_id=registered.category_id,
         )
 
         # 3b. Bump the user-turn counter exactly once per message.
@@ -224,7 +227,7 @@ class ChannelSessionService:
 
         # 5. Extra system prompt (shared_cwd_warning)
         extra_system_prompt: str | None = None
-        if effective_mode == "repo_root" and project.shared_cwd_warning:
+        if registered.shared_cwd_warning:
             extra_system_prompt = _SHARED_CWD_WARNING_TEXT
 
         # 6. Emoji status reactions on the user's message.
@@ -286,20 +289,23 @@ class ChannelSessionService:
         self,
         *,
         channel: discord.TextChannel,
-        project: ProjectConfig,
-        effective_mode: str,
+        registered: RegisteredChannel,
     ) -> tuple[str | None, str | None, str | None]:
         """Return ``(worktree_path, branch_name, working_dir)``.
 
-        Falls to ``(None, None, None)`` when the worktree cannot be ensured;
-        an error message is sent to the channel before returning.
+        Phase-2: paths derived from ``registered.slug`` (channel name), not
+        from ``channel.id`` — so renaming a channel yields a fresh worktree.
         """
+        project = registered.project
+        effective_mode = registered.cwd_mode
         if effective_mode == "dedicated_worktree":
+            assert registered.slug is not None, "dedicated_worktree requires a slug"
             paths = self._wt.plan_paths(
                 project.repo_root,
                 project.worktree_base,
                 project.branch_prefix,
-                channel.id,
+                registered.slug,
+                channel_id=channel.id,
             )
             ensure_result = await asyncio.to_thread(self._wt.ensure, paths)
             if not ensure_result.ok:
@@ -462,18 +468,109 @@ class ChannelSessionService:
         self,
         *,
         channel: discord.TextChannel,
+        user_message: discord.Message | None,
         skill_name: str,
         args: str | None,
-        project: ProjectConfig,
+        registered: RegisteredChannel,
     ) -> None:
-        """Stub for ``SkillCommandCog`` delegation in Channel-as-Session mode.
+        """Phase-2: run ``/<skill>`` in a Channel-as-Session channel.
 
-        Kept as ``NotImplementedError`` in phase 1. Step 10's
-        ``SkillCommandCog`` patch will wire this in.
+        Same pipeline as ``handle_message`` (ensure → increment_turn →
+        runner.clone → run_claude_with_config) but the prompt is the skill
+        invocation instead of free-form user text.
+
+        When ``user_message`` is None (slash-command interaction path), a
+        seed channel message is posted to anchor StatusManager reactions.
         """
-        raise NotImplementedError(
-            "run_skill_in_channel is a phase-2 integration point; not implemented in phase 1."
+        cid = channel.id
+        project = registered.project
+        effective_mode = registered.cwd_mode
+
+        worktree_path, branch_name, working_dir = await self._prepare_cwd(
+            channel=channel,
+            registered=registered,
         )
+        if working_dir is None:
+            return
+
+        record = await self._repo.ensure(
+            channel_id=cid,
+            project_name=project.name,
+            repo_root=project.repo_root,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            cwd_mode=effective_mode,
+            model=project.model,
+            permission_mode=project.permission_mode,
+            channel_name=registered.channel_name,
+            category_id=registered.category_id,
+        )
+        await self._repo.increment_turn(cid)
+
+        base_runner = self._runner_cache.get(cid)
+        if base_runner is None:
+            logger.error("runner cache miss for skill in channel_id=%d", cid)
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send("⚠️ 내부 오류: 이 채널의 runner가 준비되지 않았습니다.")
+            return
+        cloned = base_runner.clone(thread_id=cid, working_dir=working_dir)
+
+        status_anchor: discord.Message | None = user_message
+        if status_anchor is None:
+            try:
+                status_anchor = await channel.send(f"🛠️ 스킬 `{skill_name}` 실행 중…")
+            except discord.HTTPException:
+                logger.warning("run_skill_in_channel: seed send failed, aborting")
+                return
+
+        skill_prompt = f"/{skill_name}" + (f" {args}" if args else "")
+
+        extra_system_prompt: str | None = None
+        if registered.shared_cwd_warning:
+            extra_system_prompt = _SHARED_CWD_WARNING_TEXT
+
+        status = self._make_status_manager(channel, status_anchor, cloned.model)
+        await status.set_thinking()
+
+        config = RunConfig(
+            thread=channel,
+            runner=cloned,
+            prompt=skill_prompt,
+            session_id=record.session_id,
+            repo=self._repo,
+            status=status,
+            registry=None,
+            lounge_repo=None,
+            attach_on_request=wants_file_attachment(skill_prompt),
+            claude_command=cloned.command,
+            extra_system_prompt=extra_system_prompt,
+        )
+        task = asyncio.create_task(run_claude_with_config(config))
+        self._active[cid] = (cloned, task)
+        crashed = False
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            crashed = True
+            logger.exception("run_skill_in_channel raised for channel_id=%d", cid)
+        finally:
+            self._active.pop(cid, None)
+
+        if crashed:
+            await self._repo.increment_error(cid)
+        else:
+            await self._repo.reset_error(cid)
+
+        record_after = await self._repo.get(cid)
+        if record_after is not None:
+            with contextlib.suppress(Exception):
+                await self._topic.maybe_update_topic(channel, record_after)
+            with contextlib.suppress(Exception):
+                await self._topic.maybe_emit_warning(channel, record_after)
+            with contextlib.suppress(Exception):
+                await self._topic.maybe_clear_warning(record_after)
 
 
 # ---------------------------------------------------------------------------

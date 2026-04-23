@@ -1,0 +1,342 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776930426560,
+  "projectRoot": "/code/workspace/claude-code-discord-bridge-channel-as-session",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      },
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Makefile"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "make build",
+    "testCommand": "make test",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "examples",
+      "scripts",
+      "tests"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "claude_code_core": {
+      "path": "claude_code_core",
+      "purpose": null,
+      "fileCount": 9,
+      "lastAccessed": 1776930426553,
+      "keyFiles": [
+        "__init__.py",
+        "lounge_repo.py",
+        "models.py",
+        "parser.py",
+        "py.typed"
+      ]
+    },
+    "claude_discord": {
+      "path": "claude_discord",
+      "purpose": null,
+      "fileCount": 11,
+      "lastAccessed": 1776930426555,
+      "keyFiles": [
+        "__init__.py",
+        "bot.py",
+        "cli.py",
+        "cog_loader.py",
+        "concurrency.py"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 3,
+      "lastAccessed": 1776930426555,
+      "keyFiles": [
+        "ARCHITECTURE.md",
+        "DESIGN_DECISIONS.md",
+        "SECURITY.md"
+      ]
+    },
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 0,
+      "lastAccessed": 1776930426556,
+      "keyFiles": []
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 3,
+      "lastAccessed": 1776930426556,
+      "keyFiles": [
+        "build-core-wheel.sh",
+        "cleanup_worktrees.sh",
+        "pre-start.sh"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 54,
+      "lastAccessed": 1776930426557,
+      "keyFiles": [
+        "__init__.py",
+        "conftest.py",
+        "test_alert_responder.py",
+        "test_api_server.py",
+        "test_api_tasks.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "claude_discord/cogs/claude_chat.py",
+      "accessCount": 16,
+      "lastAccessed": 1776944603169,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/setup.py",
+      "accessCount": 15,
+      "lastAccessed": 1776938660877,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/services/channel_session_service.py",
+      "accessCount": 9,
+      "lastAccessed": 1776944368803,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/cogs/session_manage.py",
+      "accessCount": 9,
+      "lastAccessed": 1776944429119,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/database/channel_session_repo.py",
+      "accessCount": 9,
+      "lastAccessed": 1776944527964,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/services/channel_worktree.py",
+      "accessCount": 6,
+      "lastAccessed": 1776942090649,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/services/__init__.py",
+      "accessCount": 4,
+      "lastAccessed": 1776935294128,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/cogs/channel_session.py",
+      "accessCount": 4,
+      "lastAccessed": 1776944420151,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/services/session_lookup.py",
+      "accessCount": 3,
+      "lastAccessed": 1776933647111,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/services/topic_updater.py",
+      "accessCount": 3,
+      "lastAccessed": 1776934693510,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/__init__.py",
+      "accessCount": 3,
+      "lastAccessed": 1776935513703,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/database/channel_session_models.py",
+      "accessCount": 3,
+      "lastAccessed": 1776942114468,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/config/projects_config.py",
+      "accessCount": 3,
+      "lastAccessed": 1776942207236,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/services/runner_cache.py",
+      "accessCount": 3,
+      "lastAccessed": 1776944400673,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/cogs/run_config.py",
+      "accessCount": 2,
+      "lastAccessed": 1776935191347,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/cogs/_run_helper.py",
+      "accessCount": 2,
+      "lastAccessed": 1776935199600,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/config/__init__.py",
+      "accessCount": 2,
+      "lastAccessed": 1776942057905,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/services/channel_naming.py",
+      "accessCount": 2,
+      "lastAccessed": 1776944521124,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/claude/runner.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930655430,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/database/models.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930655936,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/database/repository.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930655973,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/worktree.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930662468,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/discord_ui/status.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930664252,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/cogs/event_processor.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930671372,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/concurrency.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930671758,
+      "type": "file"
+    },
+    {
+      "path": "claude_code_core/runner.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930678776,
+      "type": "file"
+    },
+    {
+      "path": "claude_code_core/session_repo.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930678885,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/bot.py",
+      "accessCount": 1,
+      "lastAccessed": 1776930679250,
+      "type": "file"
+    },
+    {
+      "path": "docs/CHANNEL_AS_SESSION_PHASE1.md",
+      "accessCount": 1,
+      "lastAccessed": 1776931296682,
+      "type": "file"
+    },
+    {
+      "path": "docs/CHANNEL_AS_SESSION_PHASE1_V2.md",
+      "accessCount": 1,
+      "lastAccessed": 1776932416956,
+      "type": "file"
+    },
+    {
+      "path": "docs/CHANNEL_AS_SESSION_PHASE1_V3.md",
+      "accessCount": 1,
+      "lastAccessed": 1776932646502,
+      "type": "file"
+    },
+    {
+      "path": "docs/channel_as_session.md",
+      "accessCount": 1,
+      "lastAccessed": 1776938798543,
+      "type": "file"
+    },
+    {
+      "path": "docs/CHANNEL_AS_SESSION_PHASE2.md",
+      "accessCount": 1,
+      "lastAccessed": 1776941121019,
+      "type": "file"
+    },
+    {
+      "path": "tests/unit/test_channel_naming.py",
+      "accessCount": 1,
+      "lastAccessed": 1776944450624,
+      "type": "file"
+    },
+    {
+      "path": "tests/unit/test_projects_config_phase2.py",
+      "accessCount": 1,
+      "lastAccessed": 1776944475352,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

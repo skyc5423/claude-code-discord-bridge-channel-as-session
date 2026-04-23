@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS channel_sessions (
     topic_last_set_at TEXT,
     topic_last_pct    INTEGER,
     summary           TEXT,
+    channel_name      TEXT,
+    category_id       INTEGER,
     created_at        TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     last_used_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -47,6 +49,8 @@ CREATE INDEX IF NOT EXISTS idx_channel_sessions_session_id
     ON channel_sessions(session_id);
 CREATE INDEX IF NOT EXISTS idx_channel_sessions_last_used
     ON channel_sessions(last_used_at);
+CREATE INDEX IF NOT EXISTS idx_channel_sessions_category_id
+    ON channel_sessions(category_id);
 """
 
 # Idempotent migrations. New entries go at the end — NEVER reorder.
@@ -54,7 +58,10 @@ CREATE INDEX IF NOT EXISTS idx_channel_sessions_last_used
 # OperationalError ("duplicate column name" or similar) which we suppress.
 # Any OTHER exception (disk full, syntax error) propagates — fail-fast.
 _MIGRATIONS: list[str] = [
-    # No migrations yet — schema is v3 first release.
+    # Phase-2: channel_name + category_id for name-pattern auto-registration
+    "ALTER TABLE channel_sessions ADD COLUMN channel_name TEXT",
+    "ALTER TABLE channel_sessions ADD COLUMN category_id INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_channel_sessions_category_id ON channel_sessions(category_id)",
 ]
 
 # The DB busy timeout (ms). 5 seconds is generous enough for single-user

@@ -81,6 +81,10 @@ _HELP_CATEGORY: dict[str, str | None] = {
     "worktree-list": "🔧 Advanced",
     "worktree-cleanup": "🔧 Advanced",
     "upgrade": "🔧 Advanced",
+    # Channel-as-Session commands (phase-1/2)
+    "channel-reset": "📌 Session",
+    "ch-worktree-list": "🔧 Advanced",
+    "ch-worktree-cleanup": "🔧 Advanced",
 }
 
 # Section display order in the embed.

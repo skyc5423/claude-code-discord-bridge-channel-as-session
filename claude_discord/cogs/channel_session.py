@@ -85,8 +85,8 @@ class ChannelSessionCog(commands.Cog):
             return
 
         # Scope: only projects.json-registered channels are ours.
-        project = self._projects.get(message.channel.id)
-        if project is None:
+        registered = self._projects.get(message.channel.id)
+        if registered is None:
             return
 
         # Prompt & images
@@ -112,7 +112,7 @@ class ChannelSessionCog(commands.Cog):
         await self._service.handle_message(
             channel=message.channel,
             user_message=message,
-            project=project,
+            registered=registered,
             prompt=prompt,
             images=images,
         )

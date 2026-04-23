@@ -1,29 +1,43 @@
-"""projects.json loader for Channel-as-Session mode.
+"""projects.json loader for Channel-as-Session mode (phase-2 schema).
 
-Reads a JSON file mapping Discord channel IDs to project configurations.
-The loader is fail-fast: any schema violation raises ``ConfigError`` with a
-precise location (``channel_id`` and field name) so misconfigurations are
-caught at bot startup rather than at message-handling time.
-
-Schema::
+Schema (category-keyed)::
 
     {
-      "<channel_id_string>": {
-        "name":                "project name",
-        "repo_root":           "/absolute/path",
-        "cwd_mode":            "repo_root" | "dedicated_worktree",
-        "shared_cwd_warning":  true | false,
-        "worktree_base":       ".worktrees",
-        "branch_prefix":       "channel-session",
-        "model":               "sonnet" | "opus" | ...,
-        "permission_mode":     "acceptEdits" | "default" | ...
+      "<category_id_string>": {
+        "name":               "display name (not validated)",
+        "repo_root":          "/absolute/path",
+        "shared_cwd_warning": true/false,     // default false
+        "worktree_base":      ".worktrees",   // default
+        "branch_prefix":      "channel-session",  // default
+        "model":              "sonnet",       // optional
+        "permission_mode":    "acceptEdits"   // optional
       },
       ...
     }
 
-Only ``name`` and ``repo_root`` are required. All other fields have
-sensible defaults. See ``CHANNEL_AS_SESSION_PHASE1_V3.md`` §3 for full
-validation rules.
+- Key: Discord category ID (永久 불변, rename 가능한 name 과 분리)
+- ``cwd_mode`` 는 저장되지 않음 — 매 채널마다 이름 패턴으로 동적 결정
+  (``services.channel_naming.resolve_channel_name``).
+
+In-memory model
+---------------
+
+``ProjectsConfig`` 는 두 개의 인덱스를 유지:
+
+* ``_categories`` — ``category_id → CategoryProjectConfig`` (projects.json 의 fact)
+* ``_channel_index`` — ``channel_id → RegisteredChannel`` (Discord 이벤트 +
+  startup scan 으로 채워짐. 런타임에 변경)
+
+페이즈 1 호환
+-------------
+
+페이즈 1 의 ``projects.get(channel_id)`` / ``projects.has(channel_id)`` /
+``projects.channel_ids()`` 시그니처는 그대로 유지 — 단 ``get`` 의 반환 타입이
+``ProjectConfig`` → ``RegisteredChannel`` 로 바뀌었으므로 호출부는 필드 접근
+경로를 업데이트해야 함 (예: ``project.cwd_mode`` → ``registered.cwd_mode``,
+``project.shared_cwd_warning`` → ``registered.shared_cwd_warning``).
+
+See ``docs/CHANNEL_AS_SESSION_PHASE2.md`` §2 for the full design.
 """
 
 from __future__ import annotations
@@ -31,7 +45,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -44,15 +58,17 @@ logger = logging.getLogger(__name__)
 CwdMode = Literal["repo_root", "dedicated_worktree"]
 _VALID_CWD_MODES: frozenset[str] = frozenset({"repo_root", "dedicated_worktree"})
 
-_DEFAULT_CWD_MODE: CwdMode = "dedicated_worktree"
 _DEFAULT_WORKTREE_BASE = ".worktrees"
 _DEFAULT_BRANCH_PREFIX = "channel-session"
+
+_META_KEY = "_meta"
+SCHEMA_VERSION_PHASE2 = 2
 
 
 class ConfigError(ValueError):
     """Raised when projects.json has a schema or value error.
 
-    The message always includes enough context (channel_id, field name) to
+    Message always includes enough context (category_id or field name) to
     locate the problem in the source file.
     """
 
@@ -63,77 +79,251 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
-class ProjectConfig:
-    """Configuration for a single Channel-as-Session project.
+class CategoryProjectConfig:
+    """One projects.json entry — one category = one repo = one project.
 
-    Fields are normalised at load time:
-      - ``cwd_mode`` defaults to ``"dedicated_worktree"``.
-      - When ``cwd_mode == "repo_root"``, ``worktree_base`` / ``branch_prefix``
-        are forced back to defaults (user-supplied values are ignored with a
-        warning log).
-      - When ``cwd_mode == "dedicated_worktree"``, ``shared_cwd_warning`` is
-        forced to ``False`` (warning log).
+    cwd_mode is NOT stored; it's resolved per-channel at runtime based on
+    the channel's name (``main`` vs ``wt-<slug>``).
     """
 
-    channel_id: int
+    category_id: int
     name: str
     repo_root: str
-    cwd_mode: CwdMode = _DEFAULT_CWD_MODE
     shared_cwd_warning: bool = False
     worktree_base: str = _DEFAULT_WORKTREE_BASE
     branch_prefix: str = _DEFAULT_BRANCH_PREFIX
     model: str | None = None
     permission_mode: str | None = None
 
+
+@dataclass(frozen=True)
+class RegisteredChannel:
+    """A resolved Discord channel — what callers care about at runtime.
+
+    Replaces phase-1's ``ProjectConfig`` for per-channel consumers.
+    """
+
+    channel_id: int
+    channel_name: str  # e.g. "main" or "wt-feat-auth"
+    category_id: int
+    cwd_mode: CwdMode
+    slug: str | None  # None iff cwd_mode == "repo_root"
+    worktree_path: str | None  # computed lazily; None for repo_root
+    branch_name: str | None  # None for repo_root
+    project: CategoryProjectConfig
+
+    @property
+    def shared_cwd_warning(self) -> bool:
+        """True iff this channel should get the shared-cwd system-prompt warning.
+
+        Only meaningful for repo_root mode (dedicated worktrees are isolated
+        so no shared-cwd concern).
+        """
+        return self.cwd_mode == "repo_root" and self.project.shared_cwd_warning
+
+    @property
+    def repo_root(self) -> str:
+        """Convenience accessor for ``project.repo_root``."""
+        return self.project.repo_root
+
     @property
     def uses_dedicated_worktree(self) -> bool:
-        """True when this project creates a per-channel git worktree."""
+        """Phase-1 compatibility property — for /ch-worktree-list iteration."""
         return self.cwd_mode == "dedicated_worktree"
 
 
 @dataclass(frozen=True)
+class ProjectsConfigDiff:
+    """Delta between two ProjectsConfig instances (used by hot-reload)."""
+
+    added: set[int]  # category_ids newly added
+    removed: set[int]  # category_ids dropped
+    changed: set[int]  # category_ids with config field changes
+
+    @property
+    def empty(self) -> bool:
+        return not (self.added or self.removed or self.changed)
+
+
+# ---------------------------------------------------------------------------
+# ProjectsConfig
+# ---------------------------------------------------------------------------
+
+
 class ProjectsConfig:
-    """Loaded projects.json — a keyed collection of ``ProjectConfig``."""
+    """Loaded projects.json + in-memory channel registration index.
 
-    projects: Mapping[int, ProjectConfig] = field(default_factory=dict)
-    source_path: str | None = None
+    Mutable state (``_channel_index``) is populated by:
+      * ``ChannelSessionCog._startup_scan`` at bot boot
+      * ``on_guild_channel_create`` / ``on_guild_channel_update`` events
+      * Hot-reload via ``replace_categories``
 
-    # -- accessors --------------------------------------------------------
+    Thread-safety: discord.py single-loops the cog so no locks needed.
+    """
 
-    def get(self, channel_id: int) -> ProjectConfig | None:
-        """Return the project for *channel_id*, or ``None`` if unregistered."""
-        return self.projects.get(channel_id)
+    def __init__(
+        self,
+        categories: Mapping[int, CategoryProjectConfig] | None = None,
+        source_path: str | None = None,
+    ) -> None:
+        self._categories: dict[int, CategoryProjectConfig] = dict(categories or {})
+        self._channel_index: dict[int, RegisteredChannel] = {}
+        self.source_path = source_path
+
+    # -- Category API (projects.json fact) -------------------------------
+
+    def has_category(self, category_id: int) -> bool:
+        return category_id in self._categories
+
+    def get_category(self, category_id: int) -> CategoryProjectConfig | None:
+        return self._categories.get(category_id)
+
+    def category_ids(self) -> set[int]:
+        return set(self._categories.keys())
+
+    def categories(self) -> Iterable[CategoryProjectConfig]:
+        return self._categories.values()
+
+    # -- Channel API (runtime registration index) ------------------------
 
     def has(self, channel_id: int) -> bool:
-        """True if *channel_id* is registered."""
-        return channel_id in self.projects
+        """True when the channel is currently registered.
+
+        Phase-1 compatibility shim. Backed by the in-memory ``_channel_index``
+        (populated by startup scan + Discord events), NOT by projects.json
+        directly.
+        """
+        return channel_id in self._channel_index
+
+    def get(self, channel_id: int) -> RegisteredChannel | None:
+        """Return the registered channel info, or None when unregistered.
+
+        Phase-1 compat: signature unchanged, return type now
+        ``RegisteredChannel`` instead of ``ProjectConfig``.
+        """
+        return self._channel_index.get(channel_id)
 
     def channel_ids(self) -> set[int]:
-        """Return the set of registered channel IDs."""
-        return set(self.projects.keys())
+        return set(self._channel_index.keys())
 
-    def values(self) -> Iterable[ProjectConfig]:
-        """Iterate over all project configs."""
-        return self.projects.values()
+    def registered_channels(self) -> Iterable[RegisteredChannel]:
+        return self._channel_index.values()
 
-    def __iter__(self) -> Iterator[ProjectConfig]:
-        return iter(self.projects.values())
+    # -- Registration mutators (called from Cog / startup scan) ----------
+
+    def register_channel(
+        self,
+        *,
+        channel_id: int,
+        channel_name: str,
+        category_id: int,
+    ) -> RegisteredChannel | None:
+        """Register or replace a channel in the index.
+
+        Returns the resulting ``RegisteredChannel`` or ``None`` if:
+          * ``category_id`` is not in ``_categories`` (unregistered category)
+          * the channel name fails ``resolve_channel_name`` (doesn't match
+            ``main`` / ``wt-<slug>``)
+
+        The path/branch are computed deterministically — no IO here. git
+        worktree creation happens lazily in ``handle_message``.
+        """
+        from ..services.channel_naming import (
+            branch_name as _branch,
+        )
+        from ..services.channel_naming import (
+            resolve_channel_name,
+        )
+
+        project = self._categories.get(category_id)
+        if project is None:
+            return None
+        resolved = resolve_channel_name(channel_name)
+        if resolved is None:
+            return None
+
+        if resolved.cwd_mode == "dedicated_worktree":
+            assert resolved.slug is not None
+            slug = resolved.slug
+            base = Path(project.worktree_base)
+            if not base.is_absolute():
+                base = Path(project.repo_root) / base
+            wt_path: str | None = str((base / f"ch-{slug}").resolve())
+            br_name: str | None = _branch(project.branch_prefix, slug)
+        else:
+            slug = None
+            wt_path = None
+            br_name = None
+
+        reg = RegisteredChannel(
+            channel_id=channel_id,
+            channel_name=channel_name,
+            category_id=category_id,
+            cwd_mode=resolved.cwd_mode,
+            slug=slug,
+            worktree_path=wt_path,
+            branch_name=br_name,
+            project=project,
+        )
+        self._channel_index[channel_id] = reg
+        return reg
+
+    def unregister_channel(self, channel_id: int) -> RegisteredChannel | None:
+        """Remove a channel from the index. NO DB side effect (see R2)."""
+        return self._channel_index.pop(channel_id, None)
+
+    def replace_categories(
+        self,
+        new_categories: Mapping[int, CategoryProjectConfig],
+    ) -> ProjectsConfigDiff:
+        """Atomically swap the categories dict and compute the diff.
+
+        Used by hot-reload. Channels that now belong to removed categories
+        are automatically unregistered. Channels in changed categories are
+        re-registered so they pick up the new project config.
+        """
+        old_ids = set(self._categories.keys())
+        new_ids = set(new_categories.keys())
+        added = new_ids - old_ids
+        removed = old_ids - new_ids
+
+        changed: set[int] = set()
+        for cid in old_ids & new_ids:
+            if self._categories[cid] != new_categories[cid]:
+                changed.add(cid)
+
+        self._categories = dict(new_categories)
+
+        # Re-register every indexed channel against the new categories.
+        old_index = dict(self._channel_index)
+        self._channel_index.clear()
+        for ch_id, old_reg in old_index.items():
+            if old_reg.category_id not in new_ids:
+                continue  # category removed → channel dropped
+            self.register_channel(
+                channel_id=ch_id,
+                channel_name=old_reg.channel_name,
+                category_id=old_reg.category_id,
+            )
+
+        return ProjectsConfigDiff(added=added, removed=removed, changed=changed)
+
+    # -- Dict-like convenience -------------------------------------------
+
+    def __iter__(self) -> Iterator[RegisteredChannel]:
+        return iter(self._channel_index.values())
 
     def __len__(self) -> int:
-        return len(self.projects)
+        return len(self._channel_index)
 
     def __contains__(self, channel_id: object) -> bool:
-        return channel_id in self.projects
+        return channel_id in self._channel_index
 
-    # -- loading ----------------------------------------------------------
+    # -- Loading ---------------------------------------------------------
 
     @classmethod
     def load(cls, path: str | Path) -> ProjectsConfig:
-        """Load and validate a projects.json file.
-
-        Raises ``ConfigError`` on any schema violation. The exception message
-        identifies the offending channel_id and field when possible.
-        """
+        """Load and validate a projects.json file."""
         p = Path(path)
         try:
             text = p.read_text(encoding="utf-8")
@@ -159,69 +349,62 @@ class ProjectsConfig:
         *,
         source_path: str | None = None,
     ) -> ProjectsConfig:
-        """Validate an already-parsed mapping and build a ``ProjectsConfig``.
-
-        Useful for tests that want to skip disk I/O.
-        """
         if not isinstance(raw, dict):
             raise ConfigError(
                 f"projects.json: top-level value must be an object (got {type(raw).__name__})"
             )
 
-        projects: dict[int, ProjectConfig] = {}
+        categories: dict[int, CategoryProjectConfig] = {}
         repo_roots: dict[str, list[int]] = {}
 
         for key, value in raw.items():
-            channel_id = _parse_channel_id(key)
-            project = _parse_project(channel_id, value)
-            projects[channel_id] = project
-            repo_roots.setdefault(project.repo_root, []).append(channel_id)
+            if key == _META_KEY:
+                # Reserved for migration bookkeeping. Ignored here.
+                continue
+            category_id = _parse_category_id(key)
+            cfg = _parse_category(category_id, value)
+            categories[category_id] = cfg
+            repo_roots.setdefault(cfg.repo_root, []).append(category_id)
 
-        # Same-repo_root sharing is allowed (explicit operator choice), but log.
         for repo_root, cids in repo_roots.items():
             if len(cids) > 1:
                 logger.info(
-                    "projects.json: repo_root %s is shared by %d channels: %s",
+                    "projects.json: repo_root %s is shared by %d categories: %s",
                     repo_root,
                     len(cids),
                     cids,
                 )
 
-        return cls(projects=projects, source_path=source_path)
+        return cls(categories=categories, source_path=source_path)
 
 
 # ---------------------------------------------------------------------------
-# Internal parsing helpers
+# Parsing helpers
 # ---------------------------------------------------------------------------
 
 
-def _parse_channel_id(key: Any) -> int:
-    """Convert a dict key to an int channel_id.
-
-    JSON object keys are always strings, but we accept ints too (e.g. when
-    callers build the dict programmatically).
-    """
+def _parse_category_id(key: Any) -> int:
     if isinstance(key, int):
         return key
     if isinstance(key, str):
         s = key.strip()
         if not s:
-            raise ConfigError("projects.json: channel_id key is an empty string")
+            raise ConfigError("projects.json: category_id key is an empty string")
         if not (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
-            raise ConfigError(f"projects.json: channel_id key must be numeric, got {key!r}")
+            raise ConfigError(f"projects.json: category_id key must be numeric, got {key!r}")
         try:
             return int(s)
         except ValueError as exc:
             raise ConfigError(
-                f"projects.json: channel_id key {key!r} is not a valid integer"
+                f"projects.json: category_id key {key!r} is not a valid integer"
             ) from exc
     raise ConfigError(
-        f"projects.json: channel_id key must be a string or int, got {type(key).__name__}"
+        f"projects.json: category_id key must be a string or int, got {type(key).__name__}"
     )
 
 
 def _require_str(
-    channel_id: int,
+    category_id: int,
     value: Any,
     field_name: str,
     *,
@@ -229,119 +412,56 @@ def _require_str(
 ) -> str:
     if not isinstance(value, str):
         raise ConfigError(
-            f"projects.json[channel_id={channel_id}, field={field_name!r}]: "
+            f"projects.json[category_id={category_id}, field={field_name!r}]: "
             f"must be a string (got {type(value).__name__})"
         )
     if not allow_empty and not value.strip():
         raise ConfigError(
-            f"projects.json[channel_id={channel_id}, field={field_name!r}]: "
+            f"projects.json[category_id={category_id}, field={field_name!r}]: "
             "must be a non-empty string"
         )
     return value
 
 
-def _optional_str(
-    channel_id: int,
-    value: Any,
-    field_name: str,
-) -> str | None:
+def _optional_str(category_id: int, value: Any, field_name: str) -> str | None:
     if value is None:
         return None
-    return _require_str(channel_id, value, field_name)
+    return _require_str(category_id, value, field_name)
 
 
-def _optional_bool(
-    channel_id: int,
-    value: Any,
-    field_name: str,
-) -> bool | None:
+def _optional_bool(category_id: int, value: Any, field_name: str) -> bool | None:
     if value is None:
         return None
     if not isinstance(value, bool):
         raise ConfigError(
-            f"projects.json[channel_id={channel_id}, field={field_name!r}]: "
+            f"projects.json[category_id={category_id}, field={field_name!r}]: "
             f"must be a boolean (got {type(value).__name__})"
         )
     return value
 
 
-def _parse_cwd_mode(channel_id: int, value: Any) -> CwdMode:
-    if value is None:
-        return _DEFAULT_CWD_MODE
-    if not isinstance(value, str):
-        raise ConfigError(
-            f"projects.json[channel_id={channel_id}, field='cwd_mode']: "
-            f"must be a string (got {type(value).__name__})"
-        )
-    if value not in _VALID_CWD_MODES:
-        raise ConfigError(
-            f"projects.json[channel_id={channel_id}, field='cwd_mode']: "
-            f"must be one of {sorted(_VALID_CWD_MODES)}, got {value!r}"
-        )
-    return value  # type: ignore[return-value]
-
-
-def _parse_project(channel_id: int, value: Any) -> ProjectConfig:
-    """Validate and normalise a single project entry."""
+def _parse_category(category_id: int, value: Any) -> CategoryProjectConfig:
     if not isinstance(value, dict):
         raise ConfigError(
-            f"projects.json[channel_id={channel_id}]: "
+            f"projects.json[category_id={category_id}]: "
             f"value must be an object (got {type(value).__name__})"
         )
 
-    # Required fields.
-    name = _require_str(channel_id, value.get("name"), "name")
-    repo_root = _require_str(channel_id, value.get("repo_root"), "repo_root")
+    name = _require_str(category_id, value.get("name"), "name")
+    repo_root = _require_str(category_id, value.get("repo_root"), "repo_root")
 
-    # cwd_mode — optional, defaults to dedicated_worktree.
-    cwd_mode = _parse_cwd_mode(channel_id, value.get("cwd_mode"))
+    raw_shared = _optional_bool(category_id, value.get("shared_cwd_warning"), "shared_cwd_warning")
+    shared = bool(raw_shared)
 
-    # shared_cwd_warning — optional, defaults to False.
-    raw_shared = _optional_bool(channel_id, value.get("shared_cwd_warning"), "shared_cwd_warning")
-    shared_cwd_warning = bool(raw_shared)  # None → False
+    worktree_base = _optional_str(category_id, value.get("worktree_base"), "worktree_base")
+    branch_prefix = _optional_str(category_id, value.get("branch_prefix"), "branch_prefix")
 
-    # worktree_base / branch_prefix — optional strings with defaults.
-    raw_worktree_base = _optional_str(channel_id, value.get("worktree_base"), "worktree_base")
-    raw_branch_prefix = _optional_str(channel_id, value.get("branch_prefix"), "branch_prefix")
+    model = _optional_str(category_id, value.get("model"), "model")
+    permission_mode = _optional_str(category_id, value.get("permission_mode"), "permission_mode")
 
-    # Optional passthroughs.
-    model = _optional_str(channel_id, value.get("model"), "model")
-    permission_mode = _optional_str(channel_id, value.get("permission_mode"), "permission_mode")
-
-    # Mode-specific normalisation: warn + override when fields don't match mode.
-    if cwd_mode == "repo_root":
-        if raw_worktree_base is not None:
-            logger.warning(
-                "projects.json[channel_id=%d]: cwd_mode='repo_root' ignores "
-                "'worktree_base' — value %r dropped.",
-                channel_id,
-                raw_worktree_base,
-            )
-        if raw_branch_prefix is not None:
-            logger.warning(
-                "projects.json[channel_id=%d]: cwd_mode='repo_root' ignores "
-                "'branch_prefix' — value %r dropped.",
-                channel_id,
-                raw_branch_prefix,
-            )
-        effective_worktree_base = _DEFAULT_WORKTREE_BASE
-        effective_branch_prefix = _DEFAULT_BRANCH_PREFIX
-    else:  # "dedicated_worktree"
-        if shared_cwd_warning:
-            logger.warning(
-                "projects.json[channel_id=%d]: cwd_mode='dedicated_worktree' "
-                "ignores 'shared_cwd_warning' — forced to False.",
-                channel_id,
-            )
-            shared_cwd_warning = False
-        effective_worktree_base = raw_worktree_base or _DEFAULT_WORKTREE_BASE
-        effective_branch_prefix = raw_branch_prefix or _DEFAULT_BRANCH_PREFIX
-
-    # Surface unknown fields so typos don't fail silently.
     known = {
         "name",
         "repo_root",
-        "cwd_mode",
         "shared_cwd_warning",
         "worktree_base",
         "branch_prefix",
@@ -351,19 +471,43 @@ def _parse_project(channel_id: int, value: Any) -> ProjectConfig:
     unknown = set(value.keys()) - known
     if unknown:
         logger.warning(
-            "projects.json[channel_id=%d]: unknown field(s) %s — ignored.",
-            channel_id,
+            "projects.json[category_id=%d]: unknown field(s) %s — ignored.",
+            category_id,
             sorted(unknown),
         )
 
-    return ProjectConfig(
-        channel_id=channel_id,
+    return CategoryProjectConfig(
+        category_id=category_id,
         name=name,
         repo_root=repo_root,
-        cwd_mode=cwd_mode,
-        shared_cwd_warning=shared_cwd_warning,
-        worktree_base=effective_worktree_base,
-        branch_prefix=effective_branch_prefix,
+        shared_cwd_warning=shared,
+        worktree_base=worktree_base or _DEFAULT_WORKTREE_BASE,
+        branch_prefix=branch_prefix or _DEFAULT_BRANCH_PREFIX,
         model=model,
         permission_mode=permission_mode,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase-1 compatibility shim — ProjectConfig alias
+# ---------------------------------------------------------------------------
+
+# Phase-1 had a ``ProjectConfig`` dataclass keyed by channel_id. Phase-2
+# replaces it with ``CategoryProjectConfig`` (keyed by category_id) + the
+# per-channel ``RegisteredChannel``. For third-party code still importing
+# the old name, we re-export ``CategoryProjectConfig`` as ``ProjectConfig``.
+# Field set is different; callers MUST migrate.
+ProjectConfig = CategoryProjectConfig
+
+__all__ = [
+    "CategoryProjectConfig",
+    "ConfigError",
+    "CwdMode",
+    "ProjectConfig",  # phase-1 alias
+    "ProjectsConfig",
+    "ProjectsConfigDiff",
+    "RegisteredChannel",
+    "SCHEMA_VERSION_PHASE2",
+    "_DEFAULT_BRANCH_PREFIX",
+    "_DEFAULT_WORKTREE_BASE",
+]

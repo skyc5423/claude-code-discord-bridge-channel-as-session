@@ -1,0 +1,7 @@
+{
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"/code/workspace/claude-code-discord-bridge-channel-as-session/claude_code_core\"}",
+  "error": "EISDIR: illegal operation on a directory, read '/code/workspace/claude-code-discord-bridge-channel-as-session/claude_code_core'",
+  "timestamp": "2026-04-23T07:51:04.496Z",
+  "retry_count": 2
+}
