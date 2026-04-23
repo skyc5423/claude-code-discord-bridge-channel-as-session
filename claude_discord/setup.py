@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from discord.ext.commands import Bot
 
     from .claude.runner import ClaudeRunner
+    from .config.projects_config import ProjectsConfig
+    from .database.channel_session_repo import ChannelSessionRepository
     from .database.lounge_repo import LoungeRepository
     from .database.repository import SessionRepository
     from .database.resume_repo import PendingResumeRepository
@@ -43,6 +45,9 @@ class BridgeComponents:
     task_repo: TaskRepository | None = None
     lounge_repo: LoungeRepository | None = None
     resume_repo: PendingResumeRepository | None = None
+    # Channel-as-Session (phase-2) — populated only when PROJECTS_CONFIG is set.
+    channel_session_repo: ChannelSessionRepository | None = None
+    projects_config: ProjectsConfig | None = None
 
     def apply_to_api_server(self, api_server: ApiServer) -> None:
         """Wire all optional repos to an ApiServer instance.
@@ -83,6 +88,8 @@ async def setup_bridge(
     enable_thread_inbox: bool = False,
     auto_rename_threads: bool | None = None,
     monitor_all_channels: bool | None = None,
+    projects_config_path: str | None = None,
+    channel_session_db_path: str | None = None,
 ) -> BridgeComponents:
     """Initialize and register all ccdb Cogs in one call.
 
@@ -136,11 +143,15 @@ async def setup_bridge(
     Returns:
         BridgeComponents with references to initialized repositories.
     """
+    from .cogs.channel_session import ChannelSessionCog
     from .cogs.claude_chat import ClaudeChatCog
     from .cogs.scheduler import SchedulerCog
     from .cogs.session_manage import SessionManageCog
     from .cogs.skill_command import SkillCommandCog
+    from .config.projects_config import ProjectsConfig
     from .database.ask_repo import PendingAskRepository
+    from .database.channel_session_models import init_db as init_channel_db
+    from .database.channel_session_repo import ChannelSessionRepository
     from .database.inbox_repo import ThreadInboxRepository
     from .database.lounge_repo import LoungeRepository
     from .database.models import init_db
@@ -148,6 +159,11 @@ async def setup_bridge(
     from .database.resume_repo import PendingResumeRepository
     from .database.settings_repo import SettingsRepository
     from .database.task_repo import TaskRepository
+    from .services.channel_session_service import ChannelSessionService
+    from .services.channel_worktree import ChannelWorktreeManager
+    from .services.runner_cache import RunnerCache
+    from .services.session_lookup import SessionLookupService
+    from .services.topic_updater import TopicUpdater
     from .worktree import WorktreeManager
 
     # Build the full set of claude channel IDs from both parameters
@@ -156,6 +172,32 @@ async def setup_bridge(
         _all_channel_ids.add(claude_channel_id)
     if claude_channel_ids is not None:
         _all_channel_ids.update(claude_channel_ids)
+
+    # -------- Channel-as-Session config load (phase-2) ----------
+    # Load projects.json early so channel IDs can be excluded from the thread-
+    # mode cog before it registers its listener. fail-fast — any schema error
+    # aborts bot startup with a precise message.
+    if projects_config_path is None:
+        projects_config_path = os.getenv("PROJECTS_CONFIG")
+    projects_config: ProjectsConfig | None = None
+    _pj_channel_ids: set[int] = set()
+    if projects_config_path:
+        projects_config = ProjectsConfig.load(projects_config_path)
+        _pj_channel_ids = projects_config.channel_ids()
+        logger.info(
+            "Channel-as-Session enabled: %d project(s) from %s",
+            len(projects_config),
+            projects_config_path,
+        )
+        # Hybrid-A: remove PJ channels from the thread-mode cog's channel set.
+        # Any overlap is intentional on the operator's part; we log it.
+        overlap = _all_channel_ids & _pj_channel_ids
+        if overlap:
+            logger.info(
+                "Channel overlap removed from thread-mode cog (PJ wins): %s",
+                sorted(overlap),
+            )
+            _all_channel_ids -= _pj_channel_ids
 
     # Mention-only channels — fall back to MENTION_ONLY_CHANNEL_IDS env var
     if mention_only_channel_ids is None:
@@ -261,6 +303,7 @@ async def setup_bridge(
         chat_only_channel_ids=chat_only_channel_ids or None,
         auto_rename_threads=auto_rename_threads,
         monitor_all_channels=monitor_all_channels,
+        excluded_channel_ids=_pj_channel_ids or None,
     )
     await bot.add_cog(chat_cog)
     logger.info("Registered ClaudeChatCog")
@@ -301,11 +344,69 @@ async def setup_bridge(
         await bot.add_cog(scheduler_cog)
         logger.info("Registered SchedulerCog")
 
+    # -------- ChannelSessionCog (phase-2, only when projects.json is set) --------
+    channel_session_repo: ChannelSessionRepository | None = None
+    if projects_config is not None:
+        if channel_session_db_path is None:
+            channel_session_db_path = os.getenv("CHANNEL_SESSION_DB", "data/channel_sessions.db")
+        os.makedirs(os.path.dirname(channel_session_db_path) or ".", exist_ok=True)
+        await init_channel_db(channel_session_db_path)
+        channel_session_repo = ChannelSessionRepository(channel_session_db_path)
+
+        channel_wt_manager = ChannelWorktreeManager()
+        runner_cache = RunnerCache(projects=projects_config)
+        topic_updater = TopicUpdater(repo=channel_session_repo, wt_manager=channel_wt_manager)
+        session_lookup = SessionLookupService(
+            projects=projects_config,
+            channel_session_repo=channel_session_repo,
+            session_repo=session_repo,
+        )
+        channel_service = ChannelSessionService(
+            projects=projects_config,
+            repo=channel_session_repo,
+            session_repo=session_repo,
+            runner_cache=runner_cache,
+            wt_manager=channel_wt_manager,
+            topic_updater=topic_updater,
+            session_lookup=session_lookup,
+        )
+        channel_cog = ChannelSessionCog(
+            bot,  # type: ignore[arg-type]
+            service=channel_service,
+            projects=projects_config,
+            allowed_user_ids=allowed_user_ids,
+        )
+        await bot.add_cog(channel_cog)
+        logger.info("Registered ChannelSessionCog (%d project(s))", len(projects_config))
+
+        # Expose on bot for diagnostics / external access.
+        bot.channel_session_repo = channel_session_repo  # type: ignore[attr-defined]
+        bot.channel_session_service = channel_service  # type: ignore[attr-defined]
+        bot.channel_wt_manager = channel_wt_manager  # type: ignore[attr-defined]
+        bot.session_lookup = session_lookup  # type: ignore[attr-defined]
+
+        # Step-9 rewire: inject Channel-as-Session awareness into ClaudeChatCog
+        # so relaxed slash commands (/stop, /compact, /clear, /rewind, /fork)
+        # can detect and dispatch to the channel-mode service. This is done
+        # post-construction because the service is created after the cog.
+        chat_cog._projects = projects_config
+        chat_cog._channel_session_service = channel_service
+        chat_cog._session_lookup = session_lookup
+
+        # Step-10 rewire: SessionManageCog needs session_lookup + channel repos
+        # for /context (dirty flag, worktree path) and /resume-info (channel
+        # session_id). Same post-inject pattern as ClaudeChatCog above.
+        session_manage_cog._session_lookup = session_lookup
+        session_manage_cog._channel_session_repo = channel_session_repo
+        session_manage_cog._channel_wt_manager = channel_wt_manager
+
     components = BridgeComponents(
         session_repo=session_repo,
         task_repo=task_repo,
         lounge_repo=lounge_repo,
         resume_repo=resume_repo,
+        channel_session_repo=channel_session_repo,
+        projects_config=projects_config,
     )
 
     # Auto-wire repos to ApiServer and set runner.api_port if provided

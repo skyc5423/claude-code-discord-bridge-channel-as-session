@@ -122,6 +122,9 @@ class SessionManageCog(commands.Cog):
         settings_repo: SettingsRepository | None = None,
         runner: object | None = None,
         usage_repo: UsageStatsRepository | None = None,
+        session_lookup: object | None = None,
+        channel_session_repo: object | None = None,
+        channel_wt_manager: object | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
@@ -131,6 +134,11 @@ class SessionManageCog(commands.Cog):
         # Optional ClaudeRunner reference for reading the default model.
         # Resolved lazily from ClaudeChatCog if not provided directly.
         self._runner = runner
+        # Channel-as-Session awareness (phase-2). None when PROJECTS_CONFIG
+        # is unset — /context and /resume-info fall back to thread-only.
+        self._session_lookup = session_lookup
+        self._channel_session_repo = channel_session_repo
+        self._channel_wt_manager = channel_wt_manager
 
     async def _get_thread_style(self) -> str:
         """Get the configured thread style, defaulting to 'channel'."""
@@ -552,18 +560,38 @@ class SessionManageCog(commands.Cog):
         description="Show the CLI command to resume this thread's session",
     )
     async def resume_info(self, interaction: discord.Interaction) -> None:
-        """Show the claude --resume command for the current thread."""
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.",
-                ephemeral=True,
-            )
-            return
+        """Show the claude --resume command for the current thread or channel.
 
-        record = await self.repo.get(interaction.channel.id)
-        if not record:
+        Supports both Thread and Channel-as-Session channels via SessionLookupService.
+        """
+        session_id, working_dir, model = None, None, None
+
+        if isinstance(interaction.channel, discord.Thread):
+            record = await self.repo.get(interaction.channel.id)
+            if record:
+                session_id = record.session_id
+                working_dir = record.working_dir
+                model = record.model
+        elif (
+            isinstance(interaction.channel, discord.TextChannel)
+            and self._session_lookup is not None
+        ):
+            lookup = await self._session_lookup.resolve(interaction.channel.id)  # type: ignore[attr-defined]
+            if lookup.kind == "channel":
+                session_id = lookup.session_id
+                working_dir = lookup.working_dir
+            elif lookup.kind == "channel_pending":
+                await interaction.response.send_message(
+                    "이 채널은 Channel-as-Session 채널이지만 아직 세션이 시작되지 않았습니다. "
+                    "먼저 메시지를 한 번 보내주세요.",
+                    ephemeral=True,
+                )
+                return
+
+        if session_id is None:
             await interaction.response.send_message(
-                "No session found for this thread.",
+                "This command can only be used in a Claude chat thread or a "
+                "Channel-as-Session channel with an active session.",
                 ephemeral=True,
             )
             return
@@ -571,15 +599,15 @@ class SessionManageCog(commands.Cog):
         embed = discord.Embed(
             title="\U0001f517 Resume from CLI",
             description=(
-                f"```\nclaude --resume {record.session_id}\n```\n"
+                f"```\nclaude --resume {session_id}\n```\n"
                 f"Run this command in your terminal to continue this session."
             ),
             color=COLOR_INFO,
         )
-        if record.working_dir:
-            embed.add_field(name="Working Directory", value=f"`{record.working_dir}`", inline=True)
-        if record.model:
-            embed.add_field(name="Model", value=record.model, inline=True)
+        if working_dir:
+            embed.add_field(name="Working Directory", value=f"`{working_dir}`", inline=True)
+        if model:
+            embed.add_field(name="Model", value=model, inline=True)
 
         await interaction.response.send_message(embed=embed)
 
@@ -851,15 +879,32 @@ class SessionManageCog(commands.Cog):
         description="Show the context window usage for this thread's session",
     )
     async def context_show(self, interaction: discord.Interaction) -> None:
-        """Display context window usage (%) with a progress bar and autocompact distance."""
-        if not isinstance(interaction.channel, discord.Thread):
+        """Display context window usage (%) with a progress bar and autocompact distance.
+
+        Supports both Thread and Channel-as-Session channels. For the latter,
+        extra fields are appended: Working dir / Worktree path + clean/dirty flag.
+        """
+        # Resolve record from the right repo based on channel type.
+        record = None
+        ch_record = None  # ChannelSessionRecord for Channel-as-Session extras
+        if isinstance(interaction.channel, discord.Thread):
+            record = await self.repo.get(interaction.channel.id)
+        elif (
+            isinstance(interaction.channel, discord.TextChannel)
+            and self._channel_session_repo is not None
+        ):
+            ch_record = await self._channel_session_repo.get(interaction.channel.id)  # type: ignore[attr-defined]
+            # Adapt to the shared stats interface (context_window / context_used)
+            record = ch_record
+
+        if record is None:
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in a Claude chat thread or a "
+                "Channel-as-Session channel.",
+                ephemeral=True,
             )
             return
-
-        record = await self.repo.get(interaction.channel.id)
-        if record is None or record.context_window is None or record.context_used is None:
+        if record.context_window is None or record.context_used is None:
             await interaction.response.send_message(
                 "ℹ️ No context data yet — stats are recorded after the first session completes.",
                 ephemeral=True,
@@ -893,6 +938,70 @@ class SessionManageCog(commands.Cog):
             description="\n".join(lines),
             color=color,
         )
+
+        # Channel-as-Session extras: Working dir / Worktree + dirty flag.
+        if ch_record is not None:
+            from pathlib import Path as _Path
+
+            cwd_mode = getattr(ch_record, "cwd_mode", "")
+            repo_root = getattr(ch_record, "repo_root", "") or ""
+            worktree_path = getattr(ch_record, "worktree_path", None)
+            session_id = getattr(ch_record, "session_id", None) or ""
+            turn_count = getattr(ch_record, "turn_count", 0)
+            error_count = getattr(ch_record, "error_count", 0)
+
+            if session_id:
+                embed.add_field(name="Session", value=f"`{session_id[:8]}`", inline=True)
+
+            # Working dir / Worktree field with clean/dirty marker.
+            if cwd_mode == "repo_root":
+                check_path = repo_root
+                field_name = "Working dir"
+            else:  # dedicated_worktree
+                check_path = worktree_path or ""
+                field_name = "Worktree"
+
+            if not check_path:
+                state = "(not set)"
+            elif not (_Path(check_path) / ".git").exists():
+                state = "⚠️ not a git repo"
+            elif self._channel_wt_manager is None:
+                state = "(dirty check unavailable)"
+            else:
+                import asyncio as _asyncio
+
+                try:
+                    is_clean = await _asyncio.to_thread(
+                        self._channel_wt_manager.is_clean,  # type: ignore[attr-defined]
+                        check_path,
+                        bypass_cache=True,
+                    )
+                    state = "✅ clean" if is_clean else "⚠️ dirty"
+                except Exception:
+                    state = "(dirty check failed)"
+            # Shared marker (cwd shared with other processes)
+            shared_suffix = ""
+            if cwd_mode == "repo_root" and getattr(ch_record, "project_name", ""):
+                # projects.json 의 shared_cwd_warning은 DB에 저장되지 않지만,
+                # self._session_lookup._projects 을 통해 간접 조회 가능.
+                try:
+                    projects_cfg = getattr(self._session_lookup, "_projects", None)
+                    if projects_cfg is not None:
+                        project = projects_cfg.get(interaction.channel.id)
+                        if project is not None and project.shared_cwd_warning:
+                            shared_suffix = " 🔀 shared"
+                except Exception:
+                    pass
+
+            embed.add_field(
+                name=field_name,
+                value=f"`{check_path}`\n{state}{shared_suffix}",
+                inline=False,
+            )
+            embed.add_field(name="Turns", value=str(turn_count), inline=True)
+            if error_count > 0:
+                embed.add_field(name="Errors", value=str(error_count), inline=True)
+
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(

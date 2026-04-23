@@ -13,6 +13,7 @@ from .claude.runner import ClaudeRunner
 from .claude.types import MessageType, StreamEvent, ToolCategory, ToolUseEvent
 from .cog_loader import load_custom_cogs
 from .cogs.auto_upgrade import AutoUpgradeCog, UpgradeConfig
+from .cogs.channel_session import ChannelSessionCog
 from .cogs.claude_chat import ClaudeChatCog
 from .cogs.event_processor import EventProcessor
 from .cogs.run_config import RunConfig
@@ -21,6 +22,11 @@ from .cogs.session_manage import SessionManageCog
 from .cogs.skill_command import SkillCommandCog
 from .cogs.webhook_trigger import WebhookTrigger, WebhookTriggerCog
 from .concurrency import ActiveSession, SessionRegistry
+from .config.projects_config import ConfigError, CwdMode, ProjectConfig, ProjectsConfig
+from .database.channel_session_repo import (
+    ChannelSessionRecord,
+    ChannelSessionRepository,
+)
 from .database.notification_repo import NotificationRepository
 from .database.repository import SessionRepository
 from .database.settings_repo import SettingsRepository
@@ -34,6 +40,13 @@ from .discord_ui.embeds import (
 )
 from .discord_ui.status import StatusManager
 from .protocols import DrainAware
+from .services import (
+    ChannelSessionService,
+    ChannelWorktreeManager,
+    RunnerCache,
+    SessionLookupService,
+    TopicUpdater,
+)
 from .session_sync import CliSession, SessionMessage, extract_recent_messages, scan_cli_sessions
 from .setup import BridgeComponents, setup_bridge
 
@@ -76,6 +89,19 @@ __all__ = [
     "setup_bridge",
     "BridgeComponents",
     "load_custom_cogs",
+    # Channel-as-Session (phase-2)
+    "ProjectsConfig",
+    "ProjectConfig",
+    "CwdMode",
+    "ConfigError",
+    "ChannelSessionRepository",
+    "ChannelSessionRecord",
+    "ChannelSessionCog",
+    "ChannelSessionService",
+    "ChannelWorktreeManager",
+    "RunnerCache",
+    "SessionLookupService",
+    "TopicUpdater",
     # UI
     "StatusManager",
     "chunk_message",

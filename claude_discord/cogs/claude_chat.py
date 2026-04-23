@@ -41,6 +41,9 @@ from .run_config import RunConfig
 
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
+    from ..config.projects_config import ProjectsConfig
+    from ..services.channel_session_service import ChannelSessionService
+    from ..services.session_lookup import SessionLookupService
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +109,10 @@ class ClaudeChatCog(commands.Cog):
         chat_only_channel_ids: set[int] | None = None,
         auto_rename_threads: bool = False,
         monitor_all_channels: bool = False,
+        excluded_channel_ids: set[int] | None = None,
+        projects: ProjectsConfig | None = None,
+        channel_session_service: ChannelSessionService | None = None,
+        session_lookup: SessionLookupService | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
@@ -146,6 +153,23 @@ class ClaudeChatCog(commands.Cog):
         self._settings_repo = settings_repo or getattr(bot, "settings_repo", None)
         # When True, rename the thread after creation using a claude -p title suggestion
         self._auto_rename_threads = auto_rename_threads
+        # Channel IDs that belong to Channel-as-Session mode — this cog must
+        # NOT handle messages in these channels even when monitor_all_channels
+        # is True. Step-9 (phase-2) will add the early-return gate in on_message;
+        # this field is stored now so setup_bridge can wire it without waiting.
+        self._excluded_channel_ids: set[int] = excluded_channel_ids or set()
+        # Belt-and-suspenders: strip any excluded IDs that may have slipped into
+        # _channel_ids via the bot.channel_id fallback above. This ensures the
+        # thread-mode cog never claims a registered Channel-as-Session channel,
+        # independent of when the step-9 on_message gate lands.
+        if self._excluded_channel_ids:
+            self._channel_ids -= self._excluded_channel_ids
+        # Phase-2 (step 9): Channel-as-Session awareness. These are None when
+        # PROJECTS_CONFIG is unset — every dependent check falls back to
+        # thread-only behaviour in that case.
+        self._projects = projects
+        self._channel_session_service = channel_session_service
+        self._session_lookup = session_lookup
 
     @property
     def active_session_count(self) -> int:
@@ -184,6 +208,19 @@ class ClaudeChatCog(commands.Cog):
 
         return await self._settings_repo.get(SETTING_CLAUDE_EFFORT)
 
+    def _is_session_channel(self, channel: object) -> bool:
+        """True when *channel* hosts a Claude session — Thread or registered
+        Channel-as-Session TextChannel.
+
+        Used by slash commands to relax the legacy ``isinstance(..., Thread)``
+        gate so /stop, /compact, /context, etc. work in both modes.
+        """
+        if isinstance(channel, discord.Thread):
+            return True
+        if isinstance(channel, discord.TextChannel):
+            return self._projects is not None and self._projects.has(channel.id)
+        return False
+
     async def _get_allowed_tools(self) -> list[str] | None:
         """Return the tool override from settings_repo, or None to use runner default.
 
@@ -217,6 +254,20 @@ class ClaudeChatCog(commands.Cog):
         # are the only gate (suitable for private servers).
         if self._allowed_user_ids is not None and message.author.id not in self._allowed_user_ids:
             return
+
+        # Phase-2 gate: Channel-as-Session channels (including their threads)
+        # are exclusively handled by ChannelSessionCog. This early-return
+        # protects the hybrid A+B coexistence even when monitor_all_channels
+        # is True, and guards against any future code path that bypasses
+        # the setup-level channel-id subtraction.
+        if self._excluded_channel_ids:
+            if isinstance(message.channel, discord.TextChannel):
+                if message.channel.id in self._excluded_channel_ids:
+                    return
+            elif isinstance(message.channel, discord.Thread):
+                parent_id = message.channel.parent_id or 0
+                if parent_id in self._excluded_channel_ids:
+                    return
 
         # Determine whether this channel/thread is a valid target.
         # When monitor_all_channels is True, accept any guild text/forum channel.
@@ -291,25 +342,36 @@ class ClaudeChatCog(commands.Cog):
     async def stop_session(self, interaction: discord.Interaction) -> None:
         """Stop the active Claude run without clearing the session.
 
-        Unlike /clear, this preserves the session ID so the user can
-        resume by sending a new message.
+        Works in both Thread and Channel-as-Session channels. For the latter,
+        the active runner lives in ``ChannelSessionService`` (not this cog's
+        ``_active_runners`` dict) — we dispatch based on channel type.
         """
-        if not isinstance(interaction.channel, discord.Thread):
+        if not self._is_session_channel(interaction.channel):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in a Claude chat thread or a "
+                "Channel-as-Session channel.",
+                ephemeral=True,
             )
             return
 
-        runner = self._active_runners.get(interaction.channel.id)
+        # Dispatch: Thread → local _active_runners; Channel → service
+        runner = None
+        if isinstance(interaction.channel, discord.Thread):
+            runner = self._active_runners.get(interaction.channel.id)
+        elif (
+            isinstance(interaction.channel, discord.TextChannel)
+            and self._channel_session_service is not None
+        ):
+            runner = self._channel_session_service.active_runner_for(interaction.channel.id)
+
         if not runner:
-            await interaction.response.send_message(
-                "No active session is running in this thread.", ephemeral=True
-            )
+            await interaction.response.send_message("No active session is running.", ephemeral=True)
             return
 
         await runner.interrupt()
-        # _active_runners cleanup is handled by _run_claude's finally block.
-        # We intentionally do NOT delete from the session DB so the user can resume.
+        # For threads, _active_runners cleanup is handled by _run_claude's
+        # finally block. For channels, ChannelSessionService clears its own
+        # _active dict. The session ID is intentionally preserved in both.
         await interaction.response.send_message(embed=stopped_embed())
 
     @app_commands.command(
@@ -317,44 +379,111 @@ class ClaudeChatCog(commands.Cog):
         description="Manually compact (summarize) the conversation to free context space",
     )
     async def compact_session(self, interaction: discord.Interaction) -> None:
-        """Trigger manual context compaction via the CLI's /compact command."""
-        if not isinstance(interaction.channel, discord.Thread):
+        """Trigger manual context compaction via the CLI's /compact command.
+
+        Supports both Thread and Channel-as-Session channels. For channel
+        mode, session_id + working_dir are looked up via SessionLookupService
+        so the same Thread-mode code path can consume them unchanged.
+        """
+        if not self._is_session_channel(interaction.channel):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in a Claude chat thread or a "
+                "Channel-as-Session channel.",
+                ephemeral=True,
             )
             return
 
-        thread_id = interaction.channel.id
-        record = await self.repo.get(thread_id)
-        if record is None:
-            await interaction.response.send_message(
-                "No active session found for this thread.", ephemeral=True
+        channel_id = interaction.channel.id
+
+        # Thread mode: keep legacy path for full backward compat.
+        if isinstance(interaction.channel, discord.Thread):
+            record = await self.repo.get(channel_id)
+            if record is None:
+                await interaction.response.send_message(
+                    "No active session found for this thread.", ephemeral=True
+                )
+                return
+            if channel_id in self._active_runners:
+                await interaction.response.send_message(
+                    "A session is currently running. Wait for it to finish before compacting.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer()
+            seed_message = await interaction.followup.send(
+                "🗜️ Compacting conversation...", wait=True
+            )
+            await self._run_claude(
+                user_message=seed_message,
+                thread=interaction.channel,
+                prompt="/compact",
+                session_id=record.session_id,
+                working_dir_override=record.working_dir,
+                chat_only=True,
             )
             return
 
-        if thread_id in self._active_runners:
+        # Channel-as-Session mode via SessionLookupService.
+        if self._session_lookup is None:
+            await interaction.response.send_message(
+                "Channel-as-Session support is not wired in this bot instance.",
+                ephemeral=True,
+            )
+            return
+        lookup = await self._session_lookup.resolve(channel_id)
+        if lookup.kind == "channel_pending":
+            await interaction.response.send_message(
+                "이 채널은 Channel-as-Session 채널이지만 아직 세션이 시작되지 않았습니다. "
+                "먼저 메시지를 한 번 보내주세요.",
+                ephemeral=True,
+            )
+            return
+        if lookup.kind != "channel" or lookup.session_id is None:
+            await interaction.response.send_message(
+                "No session found for this channel.", ephemeral=True
+            )
+            return
+        if (
+            self._channel_session_service is not None
+            and self._channel_session_service.active_runner_for(channel_id) is not None
+        ):
             await interaction.response.send_message(
                 "A session is currently running. Wait for it to finish before compacting.",
                 ephemeral=True,
             )
             return
-
         await interaction.response.defer()
-
         seed_message = await interaction.followup.send("🗜️ Compacting conversation...", wait=True)
-
         await self._run_claude(
             user_message=seed_message,
-            thread=interaction.channel,
+            thread=interaction.channel,  # RunConfig.thread accepts TextChannel
             prompt="/compact",
-            session_id=record.session_id,
-            working_dir_override=record.working_dir,
+            session_id=lookup.session_id,
+            working_dir_override=lookup.working_dir,
             chat_only=True,
         )
 
     @app_commands.command(name="clear", description="Reset the Claude Code session for this thread")
     async def clear_session(self, interaction: discord.Interaction) -> None:
-        """Reset the session for the current thread."""
+        """Reset the session for the current thread.
+
+        In a Channel-as-Session channel, /clear is intentionally blocked
+        and users are redirected to /channel-reset — the latter performs
+        dirty-worktree checks which /clear cannot.
+        """
+        # Role handoff: Channel-as-Session channels go through /channel-reset
+        if (
+            isinstance(interaction.channel, discord.TextChannel)
+            and self._projects is not None
+            and self._projects.has(interaction.channel.id)
+        ):
+            await interaction.response.send_message(
+                "이 채널은 Channel-as-Session 채널입니다. `/clear` 대신 "
+                "`/channel-reset` 을 사용해주세요 — dirty worktree 보호가 포함됩니다.",
+                ephemeral=True,
+            )
+            return
+
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
                 "This command can only be used in a Claude chat thread.", ephemeral=True
@@ -394,6 +523,19 @@ class ClaudeChatCog(commands.Cog):
 
         Working files created by Claude are always preserved.
         """
+        # Phase-1 scope: /rewind is not yet supported in Channel-as-Session
+        # channels (planned for phase-2). Make the limitation explicit.
+        if (
+            isinstance(interaction.channel, discord.TextChannel)
+            and self._projects is not None
+            and self._projects.has(interaction.channel.id)
+        ):
+            await interaction.response.send_message(
+                "`/rewind` 는 현재 Channel-as-Session 채널에서 지원되지 않습니다. 향후 지원 예정.",
+                ephemeral=True,
+            )
+            return
+
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
                 "This command can only be used in a Claude chat thread.", ephemeral=True
@@ -457,6 +599,20 @@ class ClaudeChatCog(commands.Cog):
         Useful when you want to try an alternative approach while keeping the current
         thread intact.
         """
+        # /fork has no meaning in a Channel-as-Session channel — there's no
+        # new thread to branch into. Surface that explicitly instead of the
+        # generic "thread only" message.
+        if (
+            isinstance(interaction.channel, discord.TextChannel)
+            and self._projects is not None
+            and self._projects.has(interaction.channel.id)
+        ):
+            await interaction.response.send_message(
+                "`/fork` 는 Thread 전용입니다. Channel-as-Session 채널에서는 지원되지 않습니다.",
+                ephemeral=True,
+            )
+            return
+
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
                 "This command can only be used in a Claude chat thread.", ephemeral=True
