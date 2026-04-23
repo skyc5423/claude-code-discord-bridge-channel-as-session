@@ -188,6 +188,15 @@ async def setup_bridge(
     _ch_db_path_for_migration = channel_session_db_path or os.getenv(
         "CHANNEL_SESSION_DB", "data/channel_sessions.db"
     )
+    # FIX (post-phase-2 bugfix): init_channel_db MUST run before the migration
+    # so that _backfill_db_records can SELECT channel_name / category_id.
+    # Without this the ALTER TABLE statements don't fire until later in the
+    # Channel-as-Session block, and the backfill crashes with
+    # "no such column: channel_name". We only init when a projects_config_path
+    # is provided — phase-1-only bots skip both migration AND init here.
+    if projects_config_path:
+        os.makedirs(os.path.dirname(_ch_db_path_for_migration) or ".", exist_ok=True)
+        await init_channel_db(_ch_db_path_for_migration)
     try:
         _mig = await _migration_phase2.run_if_needed(
             projects_config_path=projects_config_path,
@@ -209,7 +218,7 @@ async def setup_bridge(
         _pj_channel_ids = projects_config.channel_ids()
         logger.info(
             "Channel-as-Session enabled: %d project(s) from %s",
-            len(projects_config),
+            len(projects_config.category_ids()),
             projects_config_path,
         )
         # Hybrid-A: remove PJ channels from the thread-mode cog's channel set.
@@ -400,7 +409,7 @@ async def setup_bridge(
             allowed_user_ids=allowed_user_ids,
         )
         await bot.add_cog(channel_cog)
-        logger.info("Registered ChannelSessionCog (%d project(s))", len(projects_config))
+        logger.info("Registered ChannelSessionCog (%d project(s))", len(projects_config.category_ids()))
 
         # Expose on bot for diagnostics / external access.
         bot.channel_session_repo = channel_session_repo  # type: ignore[attr-defined]

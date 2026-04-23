@@ -49,8 +49,11 @@ CREATE INDEX IF NOT EXISTS idx_channel_sessions_session_id
     ON channel_sessions(session_id);
 CREATE INDEX IF NOT EXISTS idx_channel_sessions_last_used
     ON channel_sessions(last_used_at);
-CREATE INDEX IF NOT EXISTS idx_channel_sessions_category_id
-    ON channel_sessions(category_id);
+-- idx_channel_sessions_category_id intentionally lives only in _MIGRATIONS:
+-- on an upgraded DB the column is added by ALTER TABLE first, then the index
+-- is created. Putting it in SCHEMA would fail on upgraded DBs because
+-- CREATE TABLE IF NOT EXISTS is a no-op there but CREATE INDEX needs the
+-- column to exist.
 """
 
 # Idempotent migrations. New entries go at the end — NEVER reorder.
