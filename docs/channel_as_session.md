@@ -1,7 +1,61 @@
 # Channel-as-Session 모드 사용 가이드
 
 > **대상 독자**: ccdb 봇을 Discord 서버에 띄워 여러 프로젝트를 동시에 관리하려는 운영자.
-> **버전**: 페이즈 1 (초기 출시). 기존 "스레드 모드"와 병행 동작.
+> **현재 버전**: **페이즈 2** — 자동 등록, 이름 패턴 규칙, hot reload. 페이즈 1 레코드는 봇 시작 시 자동 마이그레이션.
+
+---
+
+## 페이즈 2 요약 (최신 변경)
+
+페이즈 2 에서 다음이 자동화됐다:
+
+- **새 채널 생성**: 카테고리가 `projects.json` 에 등록돼 있고 채널 이름이 `main` 또는 `wt-<slug>` 패턴이면 **자동으로 Channel-as-Session 채널로 등록**. `projects.json` 재편집 불필요.
+- **채널 이름 변경**: 기존 worktree 는 보존(dirty 보호)되고 새 이름 기준으로 재평가.
+- **채널 삭제**: worktree 가 clean 이면 제거, dirty 면 보존 + 봇 owner 에게 DM (best-effort).
+- **projects.json 수정**: 15초 내 hot reload. 봇 재시작 불필요.
+- **`/ch-worktree-cleanup --force`**: dirty worktree 도 명시적 ✅ 확인 후 제거 (escape hatch).
+
+### 페이즈 1 → 페이즈 2 스키마 변경
+
+| | 페이즈 1 | 페이즈 2 |
+|---|---------|---------|
+| **projects.json 키** | channel_id | **category_id** (Discord 카테고리 ID) |
+| **cwd_mode 결정** | projects.json 필드 | **채널 이름 패턴** (`main` / `wt-<slug>`) |
+| **새 채널 추가** | projects.json 편집 + 봇 재시작 | Discord 에서 채널 생성만 |
+| **shared_cwd_warning** | 채널 단위 | **카테고리 단위** (해당 카테고리의 `main` 채널에만 적용) |
+| **파일** | `projects.json` | `projects.json` (자동 마이그레이션) + `projects.json.pre-phase2.bak` (백업) |
+
+### 이름 패턴 규칙 (엄격 적용)
+
+- `main` → `cwd_mode="repo_root"` (카테고리 메인 채널)
+- `wt-<slug>` where `<slug>` matches `[a-z0-9][a-z0-9_-]*` → `cwd_mode="dedicated_worktree"`
+- 그 외 이름 → **조용히 무시** (카테고리 안에 잡담 채널 둘 수 있음)
+
+| 채널 이름 | 인식 결과 |
+|-----------|-----------|
+| `main` | ✅ repo_root |
+| `wt-feat-auth` | ✅ dedicated_worktree, slug=`feat-auth` |
+| `wt-docs_v2` | ✅ dedicated_worktree, slug=`docs_v2` |
+| `wt-Bug123` | ❌ 무시 (대문자) |
+| `wt-` | ❌ 무시 (slug 부재) |
+| `wt--double` | ❌ 무시 (`-` 시작) |
+| `notes`, `discussion` | ❌ 무시 (패턴 미매칭) |
+
+### 자동 마이그레이션 (페이즈 1 → 페이즈 2)
+
+페이즈 1 환경에서 페이즈 2 코드로 첫 부팅 시 자동 실행:
+
+1. `projects.json` 를 `projects.json.pre-phase2.bak` 로 백업.
+2. channel_id 키 엔트리들을 category_id 키로 변환 (하드코딩된 5개 main 채널 매핑 사용 — R1).
+3. `_meta.schema_version=2` 센티널 기록 (idempotent 보장).
+4. DB 의 기존 5개 레코드에 `channel_name='main'` + 매핑된 `category_id` 백필.
+
+마이그레이션 실패 시 `projects.json.pre-phase2.bak` 로 수동 복구 가능.
+
+---
+
+> **대상 독자**: ccdb 봇을 Discord 서버에 띄워 여러 프로젝트를 동시에 관리하려는 운영자.
+> **원본 버전**: 페이즈 1 (초기 출시). 기존 "스레드 모드"와 병행 동작.
 
 ---
 

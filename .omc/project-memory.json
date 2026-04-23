@@ -242,6 +242,12 @@
       "type": "file"
     },
     {
+      "path": "docs/channel_as_session.md",
+      "accessCount": 2,
+      "lastAccessed": 1776945739954,
+      "type": "file"
+    },
+    {
       "path": "claude_discord/claude/runner.py",
       "accessCount": 1,
       "lastAccessed": 1776930655430,
@@ -317,12 +323,6 @@
       "path": "docs/CHANNEL_AS_SESSION_PHASE1_V3.md",
       "accessCount": 1,
       "lastAccessed": 1776932646502,
-      "type": "file"
-    },
-    {
-      "path": "docs/channel_as_session.md",
-      "accessCount": 1,
-      "lastAccessed": 1776938798543,
       "type": "file"
     },
     {
