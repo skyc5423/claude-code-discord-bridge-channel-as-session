@@ -142,6 +142,11 @@ async def _build_system_context(config: RunConfig) -> str | None:
         parts.append(_POST_COMPACT_GUARDRAIL)
         logger.info("Post-compact guardrail injected for thread %d", config.thread.id)
 
+    # Caller-supplied extra block (e.g. Channel-as-Session shared_cwd_warning).
+    # Goes last so it's the most recent guidance Claude reads.
+    if config.extra_system_prompt:
+        parts.append(config.extra_system_prompt)
+
     return "\n\n".join(parts) if parts else None
 
 

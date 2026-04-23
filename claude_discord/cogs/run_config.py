@@ -85,6 +85,11 @@ class RunConfig:
     # blocks, session start/complete embeds, and other technical details are hidden.
     # Useful for public channels where non-technical users are watching.
     chat_only: bool = False
+    # Additional system-prompt block injected via --append-system-prompt, on top
+    # of the built-in lounge/registry/guardrail blocks. Consumers outside the
+    # stock flow (e.g. Channel-as-Session mode) use this to add their own
+    # guidance without patching _build_system_context.
+    extra_system_prompt: str | None = None
 
     # Prevent accidental field mutation — RunConfig is a value object.
     # Use dataclasses.replace() to create modified copies.
