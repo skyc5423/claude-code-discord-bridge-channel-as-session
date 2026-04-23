@@ -159,8 +159,10 @@ async def setup_bridge(
     from .database.resume_repo import PendingResumeRepository
     from .database.settings_repo import SettingsRepository
     from .database.task_repo import TaskRepository
+    from .migration import phase2 as _migration_phase2
     from .services.channel_session_service import ChannelSessionService
     from .services.channel_worktree import ChannelWorktreeManager
+    from .services.projects_watcher import ProjectsWatcher
     from .services.runner_cache import RunnerCache
     from .services.session_lookup import SessionLookupService
     from .services.topic_updater import TopicUpdater
@@ -179,6 +181,27 @@ async def setup_bridge(
     # aborts bot startup with a precise message.
     if projects_config_path is None:
         projects_config_path = os.getenv("PROJECTS_CONFIG")
+
+    # Phase-2 one-shot migration: channel_id-keyed → category_id-keyed JSON +
+    # DB backfill. Idempotent; already-migrated files are no-op. Runs BEFORE
+    # ProjectsConfig.load() so the loader sees the new schema.
+    _ch_db_path_for_migration = channel_session_db_path or os.getenv(
+        "CHANNEL_SESSION_DB", "data/channel_sessions.db"
+    )
+    try:
+        _mig = await _migration_phase2.run_if_needed(
+            projects_config_path=projects_config_path,
+            channel_session_db_path=_ch_db_path_for_migration,
+        )
+        if (
+            _mig.projects_json_migrated
+            or _mig.db_columns_added
+            or _mig.records_backfilled
+            or _mig.warnings
+        ):
+            logger.info("Phase-2 migration summary: %s", _mig.summary())
+    except Exception:
+        logger.exception("Phase-2 migration raised unexpectedly — continuing without migration")
     projects_config: ProjectsConfig | None = None
     _pj_channel_ids: set[int] = set()
     if projects_config_path:
@@ -399,6 +422,31 @@ async def setup_bridge(
         session_manage_cog._session_lookup = session_lookup
         session_manage_cog._channel_session_repo = channel_session_repo
         session_manage_cog._channel_wt_manager = channel_wt_manager
+
+        # Phase-2: start the projects.json hot-reload watcher.
+        async def _on_projects_change(new_cfg: ProjectsConfig) -> None:
+            """Apply hot-reloaded projects.json atomically across consumers."""
+            logger.info(
+                "projects.json hot-reload: %d category(ies) now active",
+                len(new_cfg.category_ids()),
+            )
+            # Replace categories on the live ProjectsConfig (preserves the
+            # _channel_index; the method re-registers channels against the
+            # new category set).
+            projects_config.replace_categories(dict(new_cfg.categories()))  # type: ignore[arg-type]
+            # Rebuild all runners with the potentially-changed model /
+            # permission_mode / etc. Active (already-cloned) subprocesses
+            # finish on their pre-reload template; new messages see new config.
+            runner_cache.reload(projects_config)
+
+        _watcher = ProjectsWatcher(
+            projects_config_path,
+            _on_projects_change,
+            interval_seconds=float(os.getenv("PROJECTS_WATCHER_INTERVAL_SECONDS", "15")),
+        )
+        _watcher.start()
+        bot.projects_watcher = _watcher  # type: ignore[attr-defined]
+        logger.info("ProjectsWatcher started (path=%s)", projects_config_path)
 
     components = BridgeComponents(
         session_repo=session_repo,

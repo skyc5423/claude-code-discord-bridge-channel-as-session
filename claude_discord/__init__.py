@@ -43,9 +43,13 @@ from .protocols import DrainAware
 from .services import (
     ChannelSessionService,
     ChannelWorktreeManager,
+    ProjectsWatcher,
+    ResolvedChannelName,
     RunnerCache,
     SessionLookupService,
     TopicUpdater,
+    branch_name,
+    resolve_channel_name,
 )
 from .session_sync import CliSession, SessionMessage, extract_recent_messages, scan_cli_sessions
 from .setup import BridgeComponents, setup_bridge
@@ -99,9 +103,13 @@ __all__ = [
     "ChannelSessionCog",
     "ChannelSessionService",
     "ChannelWorktreeManager",
+    "ProjectsWatcher",
+    "ResolvedChannelName",
     "RunnerCache",
     "SessionLookupService",
     "TopicUpdater",
+    "branch_name",
+    "resolve_channel_name",
     # UI
     "StatusManager",
     "chunk_message",

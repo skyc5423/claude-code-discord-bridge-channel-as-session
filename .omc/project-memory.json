@@ -128,15 +128,15 @@
   },
   "hotPaths": [
     {
-      "path": "claude_discord/cogs/claude_chat.py",
-      "accessCount": 16,
-      "lastAccessed": 1776944603169,
+      "path": "claude_discord/setup.py",
+      "accessCount": 18,
+      "lastAccessed": 1776945000153,
       "type": "file"
     },
     {
-      "path": "claude_discord/setup.py",
-      "accessCount": 15,
-      "lastAccessed": 1776938660877,
+      "path": "claude_discord/cogs/claude_chat.py",
+      "accessCount": 16,
+      "lastAccessed": 1776944603169,
       "type": "file"
     },
     {
@@ -170,6 +170,12 @@
       "type": "file"
     },
     {
+      "path": "claude_discord/__init__.py",
+      "accessCount": 6,
+      "lastAccessed": 1776945513420,
+      "type": "file"
+    },
+    {
       "path": "claude_discord/services/__init__.py",
       "accessCount": 5,
       "lastAccessed": 1776944697823,
@@ -185,12 +191,6 @@
       "path": "claude_discord/services/topic_updater.py",
       "accessCount": 3,
       "lastAccessed": 1776934693510,
-      "type": "file"
-    },
-    {
-      "path": "claude_discord/__init__.py",
-      "accessCount": 3,
-      "lastAccessed": 1776935513703,
       "type": "file"
     },
     {
@@ -233,6 +233,12 @@
       "path": "claude_discord/services/channel_naming.py",
       "accessCount": 2,
       "lastAccessed": 1776944521124,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/migration/phase2.py",
+      "accessCount": 2,
+      "lastAccessed": 1776945586746,
       "type": "file"
     },
     {
@@ -341,6 +347,12 @@
       "path": "claude_discord/services/projects_watcher.py",
       "accessCount": 1,
       "lastAccessed": 1776944685262,
+      "type": "file"
+    },
+    {
+      "path": "claude_discord/migration/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1776944896054,
       "type": "file"
     }
   ],
