@@ -130,7 +130,149 @@ class ChannelSessionCog(commands.Cog):
 
         logger.info("Registered channel deleted (id=%d) — running cleanup", channel.id)
         result = await self._service.cleanup_channel(channel.id, reason="channel_delete")
+        # Phase-2: also drop from the in-memory index
+        self._projects.unregister_channel(channel.id)
         logger.info("on_guild_channel_delete cleanup: %s", result)
+        # Best-effort DM if we preserved a dirty worktree (can't auto-clean).
+        if result.worktree_reason == "dirty":
+            await self._dm_owner_dirty_preserved(channel.name, result)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(
+        self,
+        channel: discord.abc.GuildChannel,
+    ) -> None:
+        """Phase-2: auto-register a new channel if its name matches the rules.
+
+        Silently ignores channels outside registered categories or with names
+        that don't match ``main`` / ``wt-<slug>``. No DB write here — the
+        first message triggers ``ensure()``.
+        """
+        if not isinstance(channel, discord.TextChannel):
+            return
+        if not self._projects.has_category(channel.category_id or 0):
+            return
+        reg = self._projects.register_channel(
+            channel_id=channel.id,
+            channel_name=channel.name,
+            category_id=channel.category_id or 0,
+        )
+        if reg is None:
+            # Non-matching name — silently ignored by design.
+            logger.debug(
+                "on_guild_channel_create: ignoring %d (%r) — name does not match pattern",
+                channel.id,
+                channel.name,
+            )
+            return
+        logger.info(
+            "Auto-registered channel %d (%s) in category %d as %s (slug=%s)",
+            channel.id,
+            channel.name,
+            channel.category_id or 0,
+            reg.cwd_mode,
+            reg.slug,
+        )
+
+    @commands.Cog.listener()
+    async def on_guild_channel_update(
+        self,
+        before: discord.abc.GuildChannel,
+        after: discord.abc.GuildChannel,
+    ) -> None:
+        """Phase-2: re-evaluate on name / category change.
+
+        Tears down the old state (dirty worktrees preserved per invariant) and
+        re-registers under the new name if it still matches the rules.
+        """
+        if not isinstance(after, discord.TextChannel):
+            return
+        name_changed = before.name != after.name
+        category_changed = (
+            (before.category_id if hasattr(before, "category_id") else None) or 0
+        ) != (after.category_id or 0)
+        if not (name_changed or category_changed):
+            return
+
+        was_registered = self._projects.has(after.id)
+        if was_registered:
+            logger.info(
+                "Channel %d updated (name %r→%r, cat %s→%s) — tearing down",
+                after.id,
+                getattr(before, "name", "?"),
+                after.name,
+                getattr(before, "category_id", None),
+                after.category_id,
+            )
+            result = await self._service.cleanup_channel(after.id, reason="channel_delete")
+            self._projects.unregister_channel(after.id)
+            if result.worktree_reason == "dirty":
+                await self._dm_owner_dirty_preserved(getattr(before, "name", "?"), result)
+
+        # Re-evaluate with new name/category
+        if not self._projects.has_category(after.category_id or 0):
+            return
+        reg = self._projects.register_channel(
+            channel_id=after.id,
+            channel_name=after.name,
+            category_id=after.category_id or 0,
+        )
+        if reg is not None:
+            logger.info(
+                "Re-registered channel %d as %r (slug=%s)",
+                after.id,
+                after.name,
+                reg.slug,
+            )
+
+    async def _dm_owner_dirty_preserved(
+        self,
+        channel_name: str,
+        result: object,  # ChannelCleanupResult; imported lazily
+    ) -> None:
+        """Best-effort DM to bot owner about preserved dirty worktree."""
+        owner_id = getattr(self.bot, "owner_id", None)
+        if not owner_id:
+            return
+        try:
+            owner = await self.bot.fetch_user(int(owner_id))
+            if owner is None:
+                return
+            await owner.send(
+                f"⚠️ 삭제된/변경된 채널 `{channel_name}` 의 worktree 가 "
+                f"dirty 상태라 보존됐습니다. `/ch-worktree-cleanup --force` 로 "
+                f"강제 제거할 수 있으나 커밋되지 않은 변경사항은 손실됩니다."
+            )
+        except Exception:
+            logger.debug("Could not DM owner about dirty worktree", exc_info=True)
+
+    async def startup_scan(self) -> None:
+        """Populate _channel_index from currently-visible guild channels.
+
+        Called from ``on_ready`` to recover from any create/update events
+        that happened while the bot was offline.
+        """
+        registered_count = 0
+        for guild in self.bot.guilds:
+            for ch in guild.text_channels:
+                if not self._projects.has_category(ch.category_id or 0):
+                    continue
+                reg = self._projects.register_channel(
+                    channel_id=ch.id,
+                    channel_name=ch.name,
+                    category_id=ch.category_id or 0,
+                )
+                if reg is not None:
+                    registered_count += 1
+        logger.info(
+            "ChannelSessionCog startup scan: %d channel(s) registered",
+            registered_count,
+        )
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        """Phase-2: populate channel index once the bot is connected."""
+        await self.startup_scan()
 
     # -- Helpers ----------------------------------------------------------
 
@@ -280,18 +422,18 @@ class ChannelSessionCog(commands.Cog):
                 continue
             record = await self._service._repo.get(project.channel_id)  # noqa: SLF001
             if record is None or not record.worktree_path:
-                rows.append((project.name, "(not created)", None))
+                rows.append((project.channel_name, "(not created)", None))
                 continue
             exists = os.path.isdir(record.worktree_path)
             if not exists:
-                rows.append((project.name, record.worktree_path, None))
+                rows.append((project.channel_name, record.worktree_path, None))
                 continue
             is_dirty = not await asyncio.to_thread(
                 self._service._wt.is_clean,  # noqa: SLF001
                 record.worktree_path,
                 bypass_cache=False,
             )
-            rows.append((project.name, record.worktree_path, is_dirty))
+            rows.append((project.channel_name, record.worktree_path, is_dirty))
 
         if not rows:
             embed = discord.Embed(
@@ -324,28 +466,69 @@ class ChannelSessionCog(commands.Cog):
 
     @app_commands.command(
         name="ch-worktree-cleanup",
-        description="Remove clean orphaned Channel-as-Session worktrees (dirty ones preserved)",
+        description="Remove orphaned Channel-as-Session worktrees (dirty preserved unless --force)",
     )
     @app_commands.describe(
         dry_run="Preview without actually removing anything",
+        force="DANGER: remove even dirty worktrees (loses uncommitted changes — requires ✅)",
     )
     async def ch_worktree_cleanup(
         self,
         interaction: discord.Interaction,
         dry_run: bool = False,
+        force: bool = False,
     ) -> None:
-        """Bulk cleanup — only clean worktrees, dirty preserved unconditionally."""
-        await interaction.response.defer()
+        """Bulk cleanup. By default clean-only; ``--force`` with user ✅
+        confirmation removes dirty too (``git worktree remove --force``)."""
+        # Phase-2: --force path requires explicit confirmation.
+        if force and not dry_run:
+            await interaction.response.send_message(
+                "⚠️ `--force` 지정됨. dirty worktree 까지 전부 제거합니다. "
+                "커밋되지 않은 변경사항이 **손실**됩니다.\n"
+                f"{_CONFIRM_YES} within 60s to confirm, {_CONFIRM_NO} to cancel."
+            )
+            prompt_msg = await interaction.original_response()
+            with contextlib.suppress(discord.HTTPException):
+                await prompt_msg.add_reaction(_CONFIRM_YES)
+                await prompt_msg.add_reaction(_CONFIRM_NO)
+
+            def _check(reaction: discord.Reaction, user: discord.User) -> bool:
+                if user.id != interaction.user.id:
+                    return False
+                if reaction.message.id != prompt_msg.id:
+                    return False
+                return str(reaction.emoji) in (_CONFIRM_YES, _CONFIRM_NO)
+
+            try:
+                reaction, _user = await self.bot.wait_for(
+                    "reaction_add",
+                    timeout=_CONFIRM_TIMEOUT_SECONDS,
+                    check=_check,
+                )
+            except TimeoutError:
+                await interaction.followup.send(
+                    "⏱️ Timed out — force cleanup cancelled.", ephemeral=True
+                )
+                return
+            if str(reaction.emoji) == _CONFIRM_NO:
+                await interaction.followup.send("❌ Force cleanup cancelled.", ephemeral=True)
+                return
+            # Fall through to the cleanup loop below — response already sent
+            # via interaction.response.send_message above.
+        else:
+            # force+dry_run (preview) OR plain cleanup (no force)
+            await interaction.response.defer()
 
         removed: list[str] = []
         preserved_dirty: list[str] = []
+        force_removed: list[str] = []
         skipped_repo_root: list[str] = []
         other_issues: list[tuple[str, str]] = []
         planned_cmds: list[str] = []
 
         for project in self._projects:
             if not project.uses_dedicated_worktree:
-                skipped_repo_root.append(project.name)
+                skipped_repo_root.append(project.channel_name)
                 continue
             record = await self._service._repo.get(project.channel_id)  # noqa: SLF001
             if (
@@ -363,18 +546,30 @@ class ChannelSessionCog(commands.Cog):
                 branch_name=record.branch_name,
                 channel_id=project.channel_id,
             )
-            result = await asyncio.to_thread(
-                self._service._wt.remove_if_clean,  # noqa: SLF001
-                paths,
-                dry_run=dry_run,
-            )
+            if force:
+                result = await asyncio.to_thread(
+                    self._service._wt.remove_force,  # noqa: SLF001
+                    paths,
+                    dry_run=dry_run,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    self._service._wt.remove_if_clean,  # noqa: SLF001
+                    paths,
+                    dry_run=dry_run,
+                )
             if result.removed:
-                removed.append(result.path)
+                if result.reason == "force_removed":
+                    force_removed.append(result.path)
+                else:
+                    removed.append(result.path)
             elif result.reason == "dirty":
                 preserved_dirty.append(result.path)
-            elif result.reason == "would_remove":
-                # dry-run clean candidate
-                removed.append(result.path)
+            elif result.reason in ("would_remove", "would_force_remove"):
+                # dry-run candidate
+                (force_removed if result.reason == "would_force_remove" else removed).append(
+                    result.path
+                )
                 if result.planned_commands:
                     planned_cmds.extend(result.planned_commands)
             elif result.reason == "not_exists":
@@ -382,7 +577,7 @@ class ChannelSessionCog(commands.Cog):
             else:
                 other_issues.append((result.path, result.reason))
 
-        title_suffix = " — Dry Run" if dry_run else ""
+        title_suffix = " — Dry Run" if dry_run else (" — FORCE" if force else "")
         color = _COLOR_INFO if dry_run else (_COLOR_SUCCESS if removed else _COLOR_INFO)
         if preserved_dirty:
             color = _COLOR_WARN
@@ -397,6 +592,13 @@ class ChannelSessionCog(commands.Cog):
             value="\n".join(f"`{p}`" for p in removed) or "—",
             inline=False,
         )
+        if force_removed:
+            f_label = "Would force-remove" if dry_run else "Force-removed (dirty lost)"
+            embed.add_field(
+                name=f"💥 {f_label} ({len(force_removed)})",
+                value="\n".join(f"`{p}`" for p in force_removed) or "—",
+                inline=False,
+            )
         if preserved_dirty:
             embed.add_field(
                 name=f"⚠️ Dirty — preserved ({len(preserved_dirty)})",
