@@ -373,6 +373,10 @@ class ClaudeRunner:
             decoded = line.decode("utf-8", errors="replace")
             if line_count <= 3:
                 logger.info("Claude CLI stdout line %d: %.100s", line_count, decoded.strip())
+            # PRE-A instrumentation: when CCDB_DEBUG_STREAM=1, dump every raw line
+            # so we can verify whether CLI emits permission_request events.
+            if os.environ.get("CCDB_DEBUG_STREAM") == "1":
+                logger.info("[PRE-A] raw_stream_line %d: %s", line_count, decoded.strip()[:2000])
             event = parse_line(decoded)
             if event:
                 yield event

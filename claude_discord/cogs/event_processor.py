@@ -243,6 +243,12 @@ class EventProcessor:
 
         # Permission request — show Allow/Deny buttons (always shown, even in chat_only)
         if event.permission_request is not None:
+            logger.info(
+                "[PRE-A] permission_request_seen thread=%d tool=%s request_id=%s",
+                self._config.thread.id,
+                event.permission_request.tool_name,
+                event.permission_request.request_id,
+            )
             await self._handle_permission_request(event)
             return
 
