@@ -10,6 +10,7 @@ pass user prompts as arguments without shell injection risk.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -88,6 +89,8 @@ class ClaudeRunner:
         images: list[ImageData] | None = None,
         fork_session: bool = False,
         effort: str | None = None,
+        mcp_config_path: Path | None = None,
+        permission_prompt_tool: str | None = None,
     ) -> None:
         self.command = command
         self.model = model
@@ -104,6 +107,8 @@ class ClaudeRunner:
         self.images = images
         self.fork_session = fork_session
         self.effort = effort
+        self.mcp_config_path = mcp_config_path
+        self.permission_prompt_tool = permission_prompt_tool
         self._process: asyncio.subprocess.Process | None = None
 
     async def run(
@@ -173,12 +178,17 @@ class ClaudeRunner:
         fork_session: bool = False,
         working_dir: str | None | object = _UNSET,
         effort: str | None | object = _UNSET,
+        mcp_config_path: Path | None | object = _UNSET,
+        permission_prompt_tool: str | None | object = _UNSET,
+        permission_mode: str | None = None,
     ) -> ClaudeRunner:
         """Create a fresh runner with the same configuration but no active process."""
         return ClaudeRunner(
             command=self.command,
             model=model if model is not None else self.model,
-            permission_mode=self.permission_mode,
+            permission_mode=(
+                permission_mode if permission_mode is not None else self.permission_mode
+            ),
             working_dir=(
                 self.working_dir if working_dir is _UNSET else working_dir  # type: ignore[arg-type]
             ),
@@ -199,6 +209,14 @@ class ClaudeRunner:
             fork_session=fork_session,
             effort=(
                 self.effort if effort is _UNSET else effort  # type: ignore[arg-type]
+            ),
+            mcp_config_path=(
+                self.mcp_config_path if mcp_config_path is _UNSET else mcp_config_path  # type: ignore[arg-type]
+            ),
+            permission_prompt_tool=(
+                self.permission_prompt_tool
+                if permission_prompt_tool is _UNSET
+                else permission_prompt_tool  # type: ignore[arg-type]
             ),
         )
 
@@ -311,6 +329,12 @@ class ClaudeRunner:
         if self.effort:
             args.extend(["--effort", self.effort])
 
+        if self.mcp_config_path is not None:
+            args.extend(["--mcp-config", str(self.mcp_config_path)])
+
+        if self.permission_prompt_tool is not None:
+            args.extend(["--permission-prompt-tool", self.permission_prompt_tool])
+
         if self.append_system_prompt:
             args.extend(["--append-system-prompt", self.append_system_prompt])
 
@@ -356,6 +380,19 @@ class ClaudeRunner:
         if self.thread_id is not None:
             env["DISCORD_THREAD_ID"] = str(self.thread_id)
         env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+        # When permission-prompt-tool is wired (Discord approval flow),
+        # raise the MCP tool timeout above the broker's wait time so MCP
+        # doesn't kill the approval call before the user can click. Default
+        # broker is 300s; we allow 60s of headroom.
+        if self.permission_prompt_tool:
+            approval_timeout_s = 300.0
+            override = os.environ.get("CCDB_APPROVAL_TIMEOUT", "").strip()
+            if override:
+                with contextlib.suppress(ValueError):
+                    approval_timeout_s = float(override)
+            mcp_timeout_ms = int((approval_timeout_s + 60.0) * 1000)
+            env.setdefault("MCP_TOOL_TIMEOUT", str(mcp_timeout_ms))
+            env.setdefault("MCP_TIMEOUT", str(mcp_timeout_ms))
         return env
 
     async def _read_stream(self) -> AsyncGenerator[StreamEvent, None]:

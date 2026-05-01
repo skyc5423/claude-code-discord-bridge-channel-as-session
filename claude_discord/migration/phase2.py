@@ -127,9 +127,7 @@ async def _migrate_projects_json(path_str: str, result: MigrationResult) -> None
 
     # Detect phase-1 format: keys are phase-1 channel_ids we know about.
     phase1_ids = [
-        k
-        for k in raw
-        if k != "_meta" and k.isdigit() and int(k) in _PHASE1_CHANNEL_TO_CATEGORY
+        k for k in raw if k != "_meta" and k.isdigit() and int(k) in _PHASE1_CHANNEL_TO_CATEGORY
     ]
     if not phase1_ids and not any(k != "_meta" for k in raw):
         # empty or only _meta — add sentinel and exit

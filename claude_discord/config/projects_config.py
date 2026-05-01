@@ -94,6 +94,11 @@ class CategoryProjectConfig:
     branch_prefix: str = _DEFAULT_BRANCH_PREFIX
     model: str | None = None
     permission_mode: str | None = None
+    # Approval UI (Phase A) — opt-in per category.
+    # Existing installs default to False (no change in behaviour).
+    approval_enabled: bool = False
+    approval_safe_prefixes: tuple[str, ...] | None = None  # None → use global default
+    approval_auto_deny_patterns: tuple[str, ...] | None = None  # None → use global default
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,26 @@ class RegisteredChannel:
     worktree_path: str | None  # computed lazily; None for repo_root
     branch_name: str | None  # None for repo_root
     project: CategoryProjectConfig
+
+    @property
+    def approval_policy(self) -> Any:
+        """Return an :class:`~claude_discord.mcp.prefix_allowlist.ApprovalPolicy`.
+
+        Built lazily from the category-level approval config so the config
+        module does not hard-depend on the mcp sub-package at import time.
+        Returns ``None`` when ``approval_enabled`` is False.
+        """
+        if not self.project.approval_enabled:
+            return None
+        from ..mcp.prefix_allowlist import (  # noqa: PLC0415
+            DEFAULT_AUTO_DENY_PATTERNS,
+            DEFAULT_SAFE_PREFIXES,
+            ApprovalPolicy,
+        )
+
+        safe = self.project.approval_safe_prefixes or DEFAULT_SAFE_PREFIXES
+        deny = self.project.approval_auto_deny_patterns or DEFAULT_AUTO_DENY_PATTERNS
+        return ApprovalPolicy(safe_prefixes=safe, auto_deny_patterns=deny)
 
     @property
     def shared_cwd_warning(self) -> bool:
@@ -459,6 +484,36 @@ def _parse_category(category_id: int, value: Any) -> CategoryProjectConfig:
     model = _optional_str(category_id, value.get("model"), "model")
     permission_mode = _optional_str(category_id, value.get("permission_mode"), "permission_mode")
 
+    # Approval UI fields (Phase A) — all optional, default to off/None.
+    raw_approval_enabled = _optional_bool(
+        category_id, value.get("approval_enabled"), "approval_enabled"
+    )
+    approval_enabled = bool(raw_approval_enabled)
+
+    raw_safe_prefixes = value.get("approval_safe_prefixes")
+    approval_safe_prefixes: tuple[str, ...] | None = None
+    if raw_safe_prefixes is not None:
+        if not isinstance(raw_safe_prefixes, list) or not all(
+            isinstance(s, str) for s in raw_safe_prefixes
+        ):
+            raise ConfigError(
+                f"projects.json[category_id={category_id}, field='approval_safe_prefixes']: "
+                "must be a list of strings"
+            )
+        approval_safe_prefixes = tuple(raw_safe_prefixes)
+
+    raw_auto_deny = value.get("approval_auto_deny_patterns")
+    approval_auto_deny_patterns: tuple[str, ...] | None = None
+    if raw_auto_deny is not None:
+        if not isinstance(raw_auto_deny, list) or not all(
+            isinstance(s, str) for s in raw_auto_deny
+        ):
+            raise ConfigError(
+                f"projects.json[category_id={category_id}, field='approval_auto_deny_patterns']: "
+                "must be a list of strings"
+            )
+        approval_auto_deny_patterns = tuple(raw_auto_deny)
+
     known = {
         "name",
         "repo_root",
@@ -467,6 +522,9 @@ def _parse_category(category_id: int, value: Any) -> CategoryProjectConfig:
         "branch_prefix",
         "model",
         "permission_mode",
+        "approval_enabled",
+        "approval_safe_prefixes",
+        "approval_auto_deny_patterns",
     }
     unknown = set(value.keys()) - known
     if unknown:
@@ -485,6 +543,9 @@ def _parse_category(category_id: int, value: Any) -> CategoryProjectConfig:
         branch_prefix=branch_prefix or _DEFAULT_BRANCH_PREFIX,
         model=model,
         permission_mode=permission_mode,
+        approval_enabled=approval_enabled,
+        approval_safe_prefixes=approval_safe_prefixes,
+        approval_auto_deny_patterns=approval_auto_deny_patterns,
     )
 
 

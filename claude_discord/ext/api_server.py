@@ -13,6 +13,7 @@ Security:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -20,7 +21,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
@@ -44,6 +45,108 @@ def _sanitize_log(value: object) -> str:
     attacks where an attacker embeds fake log entries in a single field.
     """
     return re.sub(r"[\r\n]", " ", str(value))
+
+
+def _aiohttp_to_asgi_scope(request: web.Request) -> dict[str, Any]:
+    """Convert aiohttp Request to an ASGI HTTP scope dict."""
+    headers = [
+        (k.lower().encode("latin-1"), v.encode("latin-1"))
+        for k, v in request.headers.items()
+    ]
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": request.method,
+        "scheme": request.scheme,
+        "path": request.path,
+        "raw_path": request.path.encode("utf-8"),
+        "query_string": request.query_string.encode("latin-1"),
+        "root_path": "",
+        "headers": headers,
+        "client": ((request.remote or "127.0.0.1"), 0),
+        "server": ("127.0.0.1", 0),
+    }
+
+
+def _make_aiohttp_asgi_bridge(
+    request: web.Request,
+) -> tuple[
+    dict[str, Any],
+    Callable[[], Awaitable[dict[str, Any]]],
+    Callable[[dict[str, Any]], Awaitable[None]],
+    asyncio.Future[web.StreamResponse],
+]:
+    """Build (scope, receive, send, response_future) for an aiohttp request.
+
+    The send callable consumes ASGI messages and writes them to a managed
+    aiohttp StreamResponse. The first ``http.response.start`` resolves
+    ``response_future`` with the StreamResponse so the outer aiohttp handler
+    can return it.
+
+    receive() reads the request body. For SSE GET there is no body — return
+    a single empty chunk then block on http.disconnect when the request is closed.
+    """
+    scope = _aiohttp_to_asgi_scope(request)
+
+    response_future: asyncio.Future[web.StreamResponse] = asyncio.get_event_loop().create_future()
+    response_holder: dict[str, Any] = {"response": None, "started": False}
+
+    body_done = False
+    body_lock = asyncio.Lock()
+
+    async def receive() -> dict[str, Any]:
+        nonlocal body_done
+        async with body_lock:
+            if body_done:
+                # Block until the task is cancelled (client disconnect).
+                fut: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+                try:
+                    return await fut
+                except asyncio.CancelledError:
+                    return {"type": "http.disconnect"}
+            chunk = await request.content.read(64 * 1024)
+            if not chunk:
+                body_done = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.request", "body": chunk, "more_body": True}
+
+    async def send(message: dict[str, Any]) -> None:
+        msg_type = message.get("type")
+        if msg_type == "http.response.start":
+            status = message.get("status", 200)
+            headers = message.get("headers", []) or []
+            response = web.StreamResponse(status=status)
+            for name, value in headers:
+                with contextlib.suppress(AttributeError, UnicodeDecodeError):
+                    response.headers[name.decode("latin-1")] = value.decode("latin-1")
+            await response.prepare(request)
+            response_holder["response"] = response
+            response_holder["started"] = True
+            if not response_future.done():
+                response_future.set_result(response)
+        elif msg_type == "http.response.body":
+            response = response_holder["response"]
+            body = message.get("body", b"") or b""
+            # Tolerate client disconnect mid-stream — common for SSE when the
+            # CLI subprocess exits or the user cancels. Without suppression,
+            # sse-starlette's keepalive ping crashes the whole task group.
+            if response is not None and body:
+                with contextlib.suppress(
+                    ConnectionResetError,
+                    ConnectionError,
+                    asyncio.CancelledError,
+                ):
+                    await response.write(body)
+            if not message.get("more_body", False) and response is not None:
+                with contextlib.suppress(
+                    ConnectionResetError,
+                    ConnectionError,
+                    asyncio.CancelledError,
+                ):
+                    await response.write_eof()
+
+    return scope, receive, send, response_future
 
 
 class ApiServer:
@@ -770,6 +873,122 @@ class ApiServer:
                 poll.add_answer(**kwargs)
 
         return poll
+
+    # ------------------------------------------------------------------
+    # MCP SSE routes (/mcp/sse, /mcp/messages)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def mount_mcp_routes(app: web.Application, broker: object | None = None) -> None:
+        """Mount MCP SSE and message routes onto an existing aiohttp Application.
+
+        Routes added:
+            GET  /mcp/sse      — SSE handshake (``text/event-stream``)
+            POST /mcp/messages — upstream message forwarding
+
+        Gracefully degrades when the ``mcp`` package is not installed:
+        logs a warning and returns without raising, so existing API server
+        users are never broken by an optional dependency being absent.
+
+        The ``channel_id`` query parameter is extracted from the SSE handshake
+        URL and injected into the MCP tool handler via a
+        ``contextvars.ContextVar`` so the tool callback knows which Discord
+        channel owns this connection without the SDK needing to support
+        per-connection context natively.
+
+        Phase A security note: the SSE routes are bound to ``127.0.0.1`` and
+        carry no authentication token.  Any process on the same host that
+        can connect to the API port and guess a valid ``channel_id`` can
+        intercept or inject approval responses.  This is acceptable for
+        single-user local deployments (see ``docs/SECURITY.md``).
+        Phase B will add per-spawn bearer tokens.
+
+        Args:
+            app: The :class:`aiohttp.web.Application` to attach routes to.
+            broker: Optional :class:`~claude_discord.mcp.approval_broker.ApprovalBroker`
+                    instance.  When ``None``, the MCP server runs in stub mode
+                    (always denies).
+        """
+        try:
+            from mcp.server.sse import SseServerTransport
+
+            from ..mcp.permission_server import _current_channel_id, build_mcp_server
+        except ImportError:
+            logger.warning(
+                "MCP approval routes not mounted: 'mcp' package is not installed. "
+                "Install with: pip install claude-code-discord-bridge[approval]"
+            )
+            return
+
+        mcp_server = build_mcp_server(broker=broker)
+        sse_transport = SseServerTransport("/mcp/messages")
+
+        async def _handle_sse(request: web.Request) -> web.StreamResponse:
+            raw_channel_id = request.rel_url.query.get("channel_id", "")
+            logger.info(
+                "MCP SSE connect: channel_id=%s remote=%s",
+                _sanitize_log(raw_channel_id),
+                _sanitize_log(request.remote or "unknown"),
+            )
+            # Inject channel_id into the ContextVar so the MCP tool handler
+            # can route the approval request to the right Discord channel.
+            try:
+                parsed_channel_id: int | None = int(raw_channel_id) if raw_channel_id else None
+            except ValueError:
+                logger.warning(
+                    "MCP SSE: invalid channel_id=%r — proceeding without channel context",
+                    raw_channel_id,
+                )
+                parsed_channel_id = None
+
+            scope, receive, send, response_future = _make_aiohttp_asgi_bridge(request)
+
+            async def _run_sse() -> None:
+                # ContextVar token must be set/reset within the same asyncio
+                # context — doing it across tasks raises "Token created in a
+                # different Context". Bind here in the task that runs MCP.
+                token = _current_channel_id.set(parsed_channel_id)
+                try:
+                    async with sse_transport.connect_sse(scope, receive, send) as (
+                        read_stream,
+                        write_stream,
+                    ):
+                        await mcp_server.run(
+                            read_stream,
+                            write_stream,
+                            mcp_server.create_initialization_options(),
+                        )
+                except Exception:
+                    logger.exception("MCP SSE handler crashed")
+                finally:
+                    _current_channel_id.reset(token)
+
+            sse_task = asyncio.create_task(_run_sse())
+
+            # Wait for the first http.response.start so we can return the StreamResponse.
+            response = await response_future
+
+            with contextlib.suppress(asyncio.CancelledError):
+                await sse_task
+            return response
+
+        async def _handle_messages(request: web.Request) -> web.StreamResponse:
+            scope, receive, send, response_future = _make_aiohttp_asgi_bridge(request)
+
+            async def _run_post() -> None:
+                try:
+                    await sse_transport.handle_post_message(scope, receive, send)
+                except Exception:
+                    logger.exception("MCP POST handler crashed")
+
+            post_task = asyncio.create_task(_run_post())
+            response = await response_future
+            await post_task
+            return response
+
+        app.router.add_get("/mcp/sse", _handle_sse)
+        app.router.add_post("/mcp/messages", _handle_messages)
+        logger.info("MCP approval routes mounted: GET /mcp/sse, POST /mcp/messages")
 
     @staticmethod
     def _build_embed(

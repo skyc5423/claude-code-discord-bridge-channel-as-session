@@ -409,7 +409,9 @@ async def setup_bridge(
             allowed_user_ids=allowed_user_ids,
         )
         await bot.add_cog(channel_cog)
-        logger.info("Registered ChannelSessionCog (%d project(s))", len(projects_config.category_ids()))
+        logger.info(
+            "Registered ChannelSessionCog (%d project(s))", len(projects_config.category_ids())
+        )
 
         # Expose on bot for diagnostics / external access.
         bot.channel_session_repo = channel_session_repo  # type: ignore[attr-defined]
@@ -472,5 +474,43 @@ async def setup_bridge(
         if runner.api_port is None:
             runner.api_port = api_server.port
         logger.info("Auto-wired repos to ApiServer (port=%d)", api_server.port)
+
+    # -------- MCP approval broker wiring (Phase A-3) --------------------
+    # Only activated when the api_server is present AND at least one project
+    # has approval_enabled=True.  Missing mcp package or disabled api_server
+    # raises ApprovalServerUnavailableError (R4 — no silent fallback).
+    _approval_needed = projects_config is not None and any(
+        cat.approval_enabled for cat in projects_config.categories()
+    )
+    if _approval_needed:
+        if api_server is None:
+            from .mcp.errors import ApprovalServerUnavailableError
+
+            raise ApprovalServerUnavailableError(
+                "approval_enabled=True requires an ApiServer to mount MCP routes. "
+                "Pass api_server= to setup_bridge() or disable approval_enabled in "
+                "projects.json."
+            )
+        try:
+            from .ext.api_server import ApiServer as _ApiServer
+            from .mcp.approval_broker import ApprovalBroker
+
+            broker = ApprovalBroker()
+            _ApiServer.mount_mcp_routes(api_server.app, broker=broker)
+            # Expose broker on bot so ChannelSessionCog can register channels.
+            bot.approval_broker = broker  # type: ignore[attr-defined]
+            # Wire broker + port into ChannelSessionService so handle_message
+            # can register/unregister channels and post approval views.
+            if projects_config is not None:
+                channel_service._approval_broker = broker  # type: ignore[union-attr]
+                channel_service._api_port = api_server.port  # type: ignore[union-attr]
+            logger.info("MCP approval broker created and SSE routes mounted")
+        except ImportError as exc:
+            from .mcp.errors import ApprovalServerUnavailableError
+
+            raise ApprovalServerUnavailableError(
+                "approval_enabled=True but the 'mcp' package is not installed. "
+                "Install with: pip install claude-code-discord-bridge[approval]"
+            ) from exc
 
     return components

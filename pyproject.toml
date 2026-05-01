@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 api = ["aiohttp>=3.9"]
+approval = ["mcp>=1.0", "aiohttp>=3.9"]
 images = ["pillow>=10.0"]
 
 [project.scripts]
@@ -34,6 +35,7 @@ dev = [
     "aiohttp>=3.9",
     "pyright>=1.1.408",
     "pillow>=12.1.1",
+    "mcp>=1.0",
 ]
 
 [tool.pytest.ini_options]

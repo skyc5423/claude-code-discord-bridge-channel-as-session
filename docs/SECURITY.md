@@ -174,3 +174,26 @@ Before merging changes to `runner.py`, `_run_helper.py`, or any Cog:
 - [ ] No string formatting in SQL queries (use `?` placeholders)
 - [ ] `allowed_user_ids` check present in any new message handler
 - [ ] No new `os.system()`, `subprocess.run(shell=True)`, or `eval()` calls
+
+## Network Security
+
+### MCP Approval SSE Routes (Phase A — Known Limitation)
+
+When `approval_enabled = true` is set in `projects.json`, ccdb mounts an SSE
+endpoint at `GET /mcp/sse` on the same local port as the REST API server
+(default `127.0.0.1:8080`).  **This endpoint carries no authentication token
+in Phase A.**  Any process on the same host that can connect to the API port
+and supply a valid `channel_id` query parameter can intercept or inject
+approval responses.
+
+Risk assessment for single-user EC2 / local deployments: **low** — a local
+attacker that can reach port 8080 already has sufficient access to compromise
+the bot process directly.
+
+For multi-user hosts, shared containers, or CI environments, disable
+`approval_enabled` until Phase B token authentication is implemented.
+Follow-up issue: "Add per-spawn bearer token to MCP SSE routes".
+
+**Phase B mitigation plan**: `build_mcp_config_for_channel()` will generate a
+32-byte random URL-safe bearer token per spawn, embed it in the mcp-config
+JSON `headers` field, and the SSE handler will validate it on connect.

@@ -36,7 +36,7 @@ import contextlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import discord
 
@@ -48,11 +48,15 @@ from ..cogs.run_config import RunConfig
 from ..config.projects_config import ProjectsConfig, RegisteredChannel
 from ..database.channel_session_repo import ChannelSessionRepository
 from ..database.repository import SessionRepository
+from ..discord_ui.approval_view import ApprovalView, build_approval_embed
 from ..discord_ui.status import StatusManager
 from .channel_worktree import ChannelWorktreeManager, EnsureResult, WorktreePaths
-from .runner_cache import RunnerCache
+from .runner_cache import RunnerCache, build_mcp_config_for_channel
 from .session_lookup import SessionLookupService
 from .topic_updater import TopicUpdater
+
+if TYPE_CHECKING:
+    from ..mcp.approval_broker import ApprovalBroker
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,8 @@ class ChannelSessionService:
         wt_manager: ChannelWorktreeManager,
         topic_updater: TopicUpdater,
         session_lookup: SessionLookupService,
+        approval_broker: ApprovalBroker | None = None,
+        api_port: int | None = None,
     ) -> None:
         self._projects = projects
         self._repo = repo
@@ -119,6 +125,8 @@ class ChannelSessionService:
         self._wt = wt_manager
         self._topic = topic_updater
         self._lookup = session_lookup
+        self._approval_broker = approval_broker
+        self._api_port = api_port
         # channel_id → (active runner, asyncio.Task). Cleared in handle_message's
         # finally block and in cleanup_channel. Never mutated concurrently
         # because discord.py single-loops the cog.
@@ -220,10 +228,77 @@ class ChannelSessionService:
                 await channel.send("⚠️ 내부 오류: 이 채널의 runner가 준비되지 않았습니다.")
             return
 
-        cloned = base_runner.clone(
-            thread_id=cid,  # EventProcessor uses this as the DB key
-            working_dir=working_dir,
+        approval_enabled = (
+            registered.project.approval_enabled
+            and self._approval_broker is not None
+            and self._api_port is not None
         )
+
+        if approval_enabled:
+            mcp_config_path = build_mcp_config_for_channel(cid, self._api_port)  # type: ignore[arg-type]
+
+            async def on_request(req: object) -> None:
+                # req is ApprovalRequest from the broker
+                logger.info(
+                    "approval on_request: channel_id=%d tool=%s request_id=%s",
+                    cid,
+                    req.tool_name,  # type: ignore[attr-defined]
+                    req.request_id,  # type: ignore[attr-defined]
+                )
+                view = ApprovalView(
+                    self._approval_broker,
+                    cid,
+                    req.request_id,  # type: ignore[attr-defined]
+                    req.tool_name,  # type: ignore[attr-defined]
+                    req.tool_input,  # type: ignore[attr-defined]
+                )
+                embed = build_approval_embed(
+                    req.tool_name,  # type: ignore[attr-defined]
+                    req.tool_input,  # type: ignore[attr-defined]
+                )
+                try:
+                    msg = await channel.send(embed=embed, view=view)
+                    logger.info(
+                        "approval on_request: posted embed channel_id=%d message_id=%d",
+                        cid,
+                        msg.id,
+                    )
+                except discord.HTTPException:
+                    logger.exception(
+                        "approval on_request: channel.send failed for channel_id=%d", cid
+                    )
+                except Exception:
+                    logger.exception(
+                        "approval on_request: unexpected error for channel_id=%d", cid
+                    )
+
+            self._approval_broker.register_channel(cid, on_request)  # type: ignore[union-attr]
+            logger.info("approval listener registered: channel_id=%d", cid)
+            # Preserve the project's configured permission_mode when it's
+            # compatible with --permission-prompt-tool. Modes that bypass or
+            # block MCP (bypassPermissions / dontAsk / plan) get coerced to
+            # "default" with a warning so the prompt-tool path stays alive.
+            mode = project.permission_mode or "default"
+            if mode not in ("default", "acceptEdits", "auto"):
+                logger.warning(
+                    "channel_id=%d permission_mode=%r incompatible with "
+                    "--permission-prompt-tool; falling back to 'default'",
+                    cid,
+                    mode,
+                )
+                mode = "default"
+            cloned = base_runner.clone(
+                thread_id=cid,
+                working_dir=working_dir,
+                mcp_config_path=mcp_config_path,
+                permission_prompt_tool="mcp__ccdb__approval_request",
+                permission_mode=mode,
+            )
+        else:
+            cloned = base_runner.clone(
+                thread_id=cid,  # EventProcessor uses this as the DB key
+                working_dir=working_dir,
+            )
 
         # 5. Extra system prompt (shared_cwd_warning)
         extra_system_prompt: str | None = None
@@ -262,6 +337,8 @@ class ChannelSessionService:
             logger.exception("run_claude_with_config raised for channel_id=%d", cid)
         finally:
             self._active.pop(cid, None)
+            if approval_enabled and self._approval_broker is not None:
+                self._approval_broker.unregister_channel(cid)
 
         # 8. Error counter + post-turn hooks
         if crashed:
